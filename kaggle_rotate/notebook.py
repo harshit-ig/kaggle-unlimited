@@ -43,6 +43,7 @@ HEALTH_PATH = "/health"
 # renders and the failure names the notebook instead of raising.
 FALLBACK_MODEL = "ternary-bonsai-2-27b-pq2"
 FALLBACK_NUM_CTX = 262144
+FALLBACK_SERVER_LOG = "/tmp/bonsai-llama-server.log"
 
 
 @dataclass
@@ -51,6 +52,10 @@ class ServedModel:
 
     model: str = FALLBACK_MODEL
     num_ctx: int = FALLBACK_NUM_CTX
+    # Where the source notebook writes llama-server's output. The readiness gate tails
+    # this on failure, so a notebook serving a different model must not be left pointing
+    # at the previous model's log.
+    server_log: str = FALLBACK_SERVER_LOG
 
 
 def _assignment(source: str, name: str) -> str | None:
@@ -80,6 +85,7 @@ def read_served_model(path: Path) -> ServedModel:
     return ServedModel(
         model=_assignment(blob, "MTP_MODEL") or FALLBACK_MODEL,
         num_ctx=parsed_ctx,
+        server_log=_assignment(blob, "SERVER_LOG") or FALLBACK_SERVER_LOG,
     )
 
 
@@ -299,7 +305,7 @@ print("Public model endpoint:", PUBLIC_OLLAMA_URL + "/v1", flush=True)
 
 READY_CELL = """\
 MODEL_NAME = "@MODEL@"
-SERVER_LOG = "/tmp/bonsai-llama-server.log"
+SERVER_LOG = "@SERVER_LOG@"
 
 def _gpu_report():
     output = _subprocess.run(
@@ -557,6 +563,7 @@ def build_notebook(config: Config, spec: LaunchSpec) -> dict[str, Any]:
         MAX_RUNTIME=int(spec.max_runtime_seconds),
         POLL_S=int(spec.shutdown_poll_seconds),
         ORPHAN_GRACE=int(spec.orphan_grace_seconds),
+        SERVER_LOG=served.server_log,
     )
 
     header = (

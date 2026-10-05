@@ -69,7 +69,7 @@ is_private = true
 # Notebook the server is built from. It is also the source of truth for the model, the
 # weights and the context window, so there is no config key for any of those: to serve a
 # different model, point this at a notebook that loads it.
-source_notebook = "bonsai2_27b_pq2_0_kaggle_llamacpp.ipynb"
+source_notebook = "qwen38_27b_uncensored_kaggle_llamacpp.ipynb"
 # Notebook self-terminates before Kaggle's hard cap.
 max_runtime_minutes = 660.0
 shutdown_poll_seconds = 20.0

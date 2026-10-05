@@ -19,6 +19,7 @@ from kaggle_rotate.naming import slugify
 from kaggle_rotate.notebook import (
     FALLBACK_MODEL,
     FALLBACK_NUM_CTX,
+    FALLBACK_SERVER_LOG,
     MODEL_BASE_URL,
     READY_CELL,
     LaunchSpec,
@@ -63,9 +64,9 @@ def _spec(**overrides) -> LaunchSpec:
     return LaunchSpec(**{**defaults, **overrides})
 
 
-def _config() -> Config:
+def _config(source_notebook: Path | str = SOURCE_NOTEBOOK) -> Config:
     config = Config()
-    config.kernel.source_notebook = str(SOURCE_NOTEBOOK)
+    config.kernel.source_notebook = str(source_notebook)
     return config
 
 
@@ -93,12 +94,46 @@ def test_served_model_is_read_from_the_real_notebook():
     served = read_served_model(SOURCE_NOTEBOOK)
     assert served.model == "ternary-bonsai-2-27b-pq2"
     assert served.num_ctx == 262144
+    assert served.server_log == "/tmp/bonsai-llama-server.log"
 
 
 def test_served_model_falls_back_when_the_notebook_declares_nothing(tmp_path):
     served = read_served_model(tmp_path / "missing.ipynb")
     assert served.model == FALLBACK_MODEL
     assert served.num_ctx == FALLBACK_NUM_CTX
+    assert served.server_log == FALLBACK_SERVER_LOG
+
+
+def test_server_log_follows_the_notebook_not_the_previous_model(tmp_path):
+    """A notebook serving a different model must not tail the old model's log."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ['SERVER_LOG = "/tmp/qwen38-llama-server.log"\n'],
+            }
+        ]
+    }
+    path = tmp_path / "nb.ipynb"
+    path.write_text(json.dumps(notebook))
+    assert read_served_model(path).server_log == "/tmp/qwen38-llama-server.log"
+
+
+def test_readiness_gate_tails_the_declared_log(tmp_path):
+    """The boot-time failure message has to point at the log that was actually written."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ['SERVER_LOG = "/tmp/other-server.log"\n'],
+            }
+        ]
+    }
+    path = tmp_path / "nb.ipynb"
+    path.write_text(json.dumps(notebook))
+    blob = _raw_blob(build_notebook(_config(path), _spec()))
+    assert 'SERVER_LOG = "/tmp/other-server.log"' in blob
+    assert "/tmp/bonsai-llama-server.log" not in blob
 
 
 def test_served_model_ignores_an_unparseable_context(tmp_path):

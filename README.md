@@ -63,10 +63,10 @@ uv run kaggle-rotate stop           # stop a backgrounded pool
 ```
 
 First boot clones `PrismML-Eng/Bonsai-demo`, compiles it with CUDA, and pulls the
-7.2 GB `PQ2_0` GGUF, so expect **20–40 minutes** before the endpoint answers — this is a
-full compiler build, not a package install. The pool prints a progress line for each
-stage; `run/kaggle-rotate.log` has the full history. Subsequent sessions reuse the same
-notebook, so treat the first one as the slow one.
+7.2 GB `PQ2_0` GGUF. **Measured: about 7 minutes** end to end on 2× T4, from push to
+answering requests — the CUDA build turns out to be quick. Budget 10 minutes to be safe
+and keep `rotation.prewarm_lead_minutes` well above it. The pool prints a progress line
+every 60s; `run/kaggle-rotate.log` has the full history.
 
 ## Point your client at it
 
@@ -220,20 +220,17 @@ uv run kaggle-rotate cleanup        # delete it
   and a kernel would never notice it had been abandoned. The pool now pulses the relay
   every tick, the relay reports `driver_alive`, and a kernel that stops seeing pulses
   shuts itself down after `kernel.orphan_grace_seconds`.
-- **Notebook boot time is the hard floor on lead time**, and it is much larger with this
-  runtime than it was under Ollama. Budget **20–40 minutes** for the first boot: a git
-  clone, a CUDA compile of `llama.cpp`, a 7.2 GB download, then the model load at
-  262,144 context. `rotation.prewarm_lead_minutes` (default 120) must comfortably exceed
-  it or a rotation will open a gap where no session is serving. Verify it on your first
-  boot and raise the lead if the log shows it taking longer.
-  `rotation.boot_timeout_seconds` (default 2400) also has to cover that build — raise it
-  if the pool gives up mid-boot.
+- **Notebook boot time is the hard floor on lead time.** Measured at ~7 minutes (git
+  clone, CUDA compile, 7.2 GB download, then loading at 262,144 context), so
+  `rotation.prewarm_lead_minutes` at its 120-minute default has ample room. Re-measure
+  if you swap in a bigger model or a slower accelerator; `rotation.boot_timeout_seconds`
+  (2400) has to cover the whole build.
 - **Weekly quota is estimated from wall time**, since Kaggle only reports real GPU
   seconds after a session ends. Slight over-counting is deliberate.
 - **Boot is a compiler build, not a package install.** Each session clones
   `Bonsai-demo` and builds it with CUDA, then pulls 7.2 GB. A published Kaggle dataset
-  holding the compiled runtime and the GGUF would cut this substantially — it is the
-  single biggest win available.
+  holding the compiled runtime and the GGUF would cut this further, though at ~7 minutes
+  it is no longer the bottleneck it looked like.
 - `cleanup` deletes the kernel this tool created (`kaggle-rotate-llamacpp` under each
   account). It cannot distinguish that kernel from your own runs, so point
   `kernel.kernel_slug` at something you do not use for anything else.

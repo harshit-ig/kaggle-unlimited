@@ -1,0 +1,75 @@
+# Every value here is the built-in default. Copy to config.toml and edit what you need:
+#   cp config.example.toml config.toml
+# Unknown keys are a hard error, so typos fail loudly instead of silently doing nothing.
+
+state_dir = "run"
+
+[proxy]
+host = "127.0.0.1"
+port = 8317
+# Seconds a client request waits for the pool to hand it a usable upstream.
+connect_grace_seconds = 90.0
+# Retry once against the standby if the active upstream dies before replying.
+retry_on_standby = true
+# How long a retired upstream stays reachable so in-flight streams can finish.
+drain_grace_seconds = 30.0
+
+[relay]
+host = "127.0.0.1"
+port = 8318
+# Publish the relay through a Cloudflare quick tunnel so Kaggle can call back.
+# Set public_url instead if you already expose a stable hostname (named tunnel).
+expose = true
+tunnel_start_timeout = 90.0
+public_url = ""
+
+[rotation]
+session_limit_hours = 12.0
+weekly_limit_hours = 30.0
+# GPU time held back so a warmed session always has somewhere to go.
+boot_reserve_hours = 1.5
+# Start the next account this long before the active one hits its session cap.
+prewarm_lead_minutes = 120.0
+# Do not begin a session within this of a weekly cap.
+weekly_safety_minutes = 60.0
+# Serving sessions at once. Rotation briefly runs one extra (warming) kernel.
+max_active_sessions = 1
+# Pause between cutting clients over and telling the old kernel to exit.
+drain_grace_seconds = 60.0
+boot_timeout_seconds = 2400.0
+# A kernel silent for this long is presumed dead.
+heartbeat_grace_seconds = 240.0
+# 0 disables idle shutdown (stops a session when nobody calls the endpoint).
+idle_stop_minutes = 0.0
+tick_seconds = 10.0
+# Backoff after a failed launch (bad credentials, push refused, ...).
+launch_retry_seconds = 120.0
+launch_retry_max_seconds = 1800.0
+
+[kernel]
+accelerator = "NvidiaTeslaT4"
+kernel_slug = "kaggle-rotate-ollama"
+# Must slugify to kernel_slug: Kaggle derives the kernel id from the title.
+title = ""
+is_private = true
+# Notebook the model/ctx settings are read from.
+source_notebook = "qwen38_27b_kaggle_ollama_mtp_clean_64k.ipynb"
+# Empty = inherit from source_notebook.
+source_model = ""
+model = ""
+num_ctx = 65536
+draft_num_predict = 2
+# Notebook self-terminates before Kaggle's hard cap.
+max_runtime_minutes = 660.0
+shutdown_poll_seconds = 20.0
+# Backstop: a kernel that cannot reach the relay for this long stops itself.
+orphan_grace_seconds = 300.0
+# Explicit path to cloudflared; empty = use PATH, else download into state_dir/bin.
+cloudflared_path = ""
+
+[kaggle]
+command = "kaggle"
+config_root = "~/.config/kaggle-rotate"
+cli_timeout_seconds = 60.0
+# Delete can take 60-150s; cutting it off leaves the kernel running and billing.
+delete_timeout_seconds = 300.0

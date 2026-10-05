@@ -126,6 +126,15 @@ class Config:
             path = self.root / path
         return path
 
+    def kernel_ref(self, username: str) -> str:
+        """The Kaggle kernel this tool owns for `username`.
+
+        Kaggle derives a kernel's slug from its title, and `kernel-metadata.json`'s `id`
+        has to match that or the push is rejected. Both the `id` and the title are built
+        from `kernel.kernel_slug`, and both are built *here* so they cannot drift apart.
+        """
+        return f"{username}/{self.kernel.kernel_slug}"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "proxy": asdict(self.proxy),

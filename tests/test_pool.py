@@ -44,10 +44,7 @@ class StubCLI:
 
 
 def _accounts(n: int) -> dict[str, Account]:
-    return {
-        f"acct{i}": Account(slug=f"acct{i}", username=f"user{i}", kernel_slug="krotate")
-        for i in range(n)
-    }
+    return {f"acct{i}": Account(slug=f"acct{i}", username=f"user{i}") for i in range(n)}
 
 
 def _pool(tmp_path: Path, accounts: dict[str, Account], cli=None) -> Pool:

@@ -505,10 +505,11 @@ class Pool:
     async def _launch(self, account: Account) -> LaunchSpec:
         kernel = self.config.kernel
         served = read_served_model(self.config.resolved_source_notebook())
+        kernel_ref = self.config.kernel_ref(account.username)
         token = secrets.token_urlsafe(32)
         spec = LaunchSpec(
             account=account.slug,
-            kernel_ref=account.ref,
+            kernel_ref=kernel_ref,
             relay_url=self.relay_public_url,
             token=token,
             model=served.model,
@@ -523,14 +524,14 @@ class Pool:
         self.state.update(
             account.slug,
             state="launching",
-            kernel_ref=account.ref,
+            kernel_ref=kernel_ref,
             token=token,
             started_at=time.time(),
             url="",
             model=served.model,
             detail="pushing kernel",
         )
-        log.info("pushing kernel for %s (%s)", account.slug, account.ref)
+        log.info("pushing kernel for %s (%s)", account.slug, kernel_ref)
 
         timeout_s = int(kernel.max_runtime_minutes * 60) + 600
         argv = [
@@ -587,7 +588,8 @@ class Pool:
                     status = await self.cli.astatus(account)
                     if status.known and status.failed:
                         raise RuntimeError(
-                            f"kernel {account.ref} {status.state} during boot; open the "
+                            f"kernel {self.config.kernel_ref(account.username)} "
+                            f"{status.state} during boot; open the "
                             "notebook on kaggle.com to read the cell output"
                         )
 

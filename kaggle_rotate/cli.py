@@ -285,7 +285,7 @@ def cmd_cleanup(args: argparse.Namespace, config: Config) -> int:
 
     failed: list[str] = []
     for account in accounts.values():
-        label = f"{account.slug} ({account.ref})"
+        label = f"{account.slug} ({config.kernel_ref(account.username)})"
         if args.dry_run:
             print(f"  -- {label}: would delete")
             continue

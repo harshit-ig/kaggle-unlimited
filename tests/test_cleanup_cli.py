@@ -4,6 +4,7 @@ import argparse
 
 from kaggle_rotate import cli as cli_module
 from kaggle_rotate.accounts import Account, KaggleError
+from kaggle_rotate.config import Config
 
 
 class FakeCLI:
@@ -27,8 +28,16 @@ class FakeCLI:
         raise AssertionError("status should not be consulted when delete succeeds")
 
 
+def _config() -> Config:
+    """A real Config: cleanup derives the kernel ref from it, so a stub would not
+    notice if the ref stopped agreeing with what a push would send."""
+    config = Config()
+    config.kernel.kernel_slug = "krotate"
+    return config
+
+
 def _run(fake, tmp_path, monkeypatch, capsys):
-    config = argparse.Namespace()
+    config = _config()
     monkeypatch.setattr(cli_module, "KaggleCLI", lambda *a, **k: fake)
     monkeypatch.setattr(cli_module, "AccountStore", lambda *a, **k: _FakeStore(tmp_path))
     args = argparse.Namespace(dry_run=False)
@@ -42,7 +51,7 @@ class _FakeStore:
         self.config_root = tmp_path
 
     def load(self):
-        return {"a": Account(slug="a", username="u", kernel_slug="krotate")}
+        return {"a": Account(slug="a", username="u")}
 
 
 def test_cleanup_reports_a_real_delete(monkeypatch, capsys, tmp_path):
@@ -64,7 +73,7 @@ def test_cleanup_does_not_claim_success_when_the_kernel_is_gone(monkeypatch, cap
 
 def test_dry_run_changes_nothing(monkeypatch, capsys, tmp_path):
     fake = FakeCLI(delete_ok=True, gone=False)
-    config = argparse.Namespace()
+    config = _config()
     monkeypatch.setattr(cli_module, "KaggleCLI", lambda *a, **k: fake)
     monkeypatch.setattr(cli_module, "AccountStore", lambda *a, **k: _FakeStore(tmp_path))
     cli_module.cmd_cleanup(argparse.Namespace(dry_run=True), config)

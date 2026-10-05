@@ -19,7 +19,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .config import Config
-from .naming import slugify
 
 log = logging.getLogger("kaggle_rotate.accounts")
 
@@ -31,7 +30,6 @@ class Account:
     slug: str
     username: str
     kind: str = "kaggle_json"
-    kernel_slug: str = ""
     enabled: bool = True
     label: str = ""
     # Sessions are attributed to this account in the quota ledger.
@@ -41,13 +39,6 @@ class Account:
     def __post_init__(self) -> None:
         if self.kind not in _CRED_KINDS:
             raise ValueError(f"credential kind must be one of {_CRED_KINDS}")
-        if not self.kernel_slug:
-            self.kernel_slug = "kaggle-rotate-ollama"
-        self.kernel_slug = slugify(self.kernel_slug) or "kaggle-rotate-ollama"
-
-    @property
-    def ref(self) -> str:
-        return f"{self.username}/{self.kernel_slug}"
 
     def effective_weekly_limit(self, default: float) -> float:
         return self.weekly_limit_hours or default
@@ -93,7 +84,21 @@ class AccountStore:
         if not self.registry_path.exists():
             return {}
         raw = json.loads(self.registry_path.read_text())
-        return {name: Account(**data) for name, data in raw.items()}
+        accounts: dict[str, Account] = {}
+        for name, data in raw.items():
+            data = dict(data)
+            # `kernel_slug` used to be stored per account as well as in config, which let
+            # the two disagree and produced a kernel-metadata.json whose `id` did not
+            # match the slug Kaggle derives from the title (rejected on push). The slug
+            # now comes from config alone, so drop any stored copy on the way in.
+            if data.pop("kernel_slug", None) is not None:
+                log.warning(
+                    "%s: ignoring stored kernel_slug; kernel.kernel_slug in config is "
+                    "now the only source of truth",
+                    name,
+                )
+            accounts[name] = Account(**data)
+        return accounts
 
     def save(self, accounts: dict[str, Account]) -> None:
         self.config.config_root.mkdir(parents=True, exist_ok=True)
@@ -221,6 +226,10 @@ class KaggleCLI:
     config: Config
     store: AccountStore
 
+    def ref(self, account: Account) -> str:
+        """The kernel ref this tool owns for `account`, single-sourced from config."""
+        return self.config.kernel_ref(account.username)
+
     def run(
         self,
         account: Account,
@@ -263,7 +272,9 @@ class KaggleCLI:
         ).stdout
 
     def status(self, account: Account) -> StatusResult:
-        return parse_status(self.run(account, "kernels", "status", account.ref).stdout)
+        return parse_status(
+            self.run(account, "kernels", "status", self.config.kernel_ref(account.username)).stdout
+        )
 
     async def astatus(self, account: Account, timeout: float | None = None) -> StatusResult:
         """Async status probe.
@@ -273,7 +284,12 @@ class KaggleCLI:
         which reads to the user as the API being down. Every pool-side call goes
         through here so the loop keeps serving traffic.
         """
-        argv = [self.config.kaggle.command, "kernels", "status", account.ref]
+        argv = [
+            self.config.kaggle.command,
+            "kernels",
+            "status",
+            self.config.kernel_ref(account.username),
+        ]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -302,7 +318,13 @@ class KaggleCLI:
         Deleting is the only dependable stop, so a silent failure here means GPU time
         keeps being billed. Never discard the exit code or stderr.
         """
-        argv = [self.config.kaggle.command, "kernels", "delete", account.ref, "--yes"]
+        argv = [
+            self.config.kaggle.command,
+            "kernels",
+            "delete",
+            self.config.kernel_ref(account.username),
+            "--yes",
+        ]
         limit = timeout or self.config.kaggle.delete_timeout_seconds
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -325,7 +347,9 @@ class KaggleCLI:
 
         output = stdout.decode("utf-8", "replace").strip()
         if proc.returncode == 0:
-            log.info("%s deleted (%s)", account.ref, output or "no output")
+            log.info(
+                "%s deleted (%s)", self.config.kernel_ref(account.username), output or "no output"
+            )
             return True
 
         log.error(
@@ -342,25 +366,44 @@ class KaggleCLI:
         Kaggle answers 403 for a kernel that is already gone, so a non-zero exit here
         does not necessarily mean something is still running. Verify with `status`.
         """
-        proc = self.run(account, "kernels", "delete", account.ref, "--yes", check=False)
+        proc = self.run(
+            account,
+            "kernels",
+            "delete",
+            self.config.kernel_ref(account.username),
+            "--yes",
+            check=False,
+        )
         if proc.returncode == 0:
-            log.info("%s deleted (%s)", account.ref, proc.stdout.strip() or "no output")
+            log.info(
+                "%s deleted (%s)",
+                self.config.kernel_ref(account.username),
+                proc.stdout.strip() or "no output",
+            )
             return True
         log.error(
             "%s delete failed (exit %s): %s",
-            account.ref,
+            self.config.kernel_ref(account.username),
             proc.returncode,
             (proc.stderr or proc.stdout).strip()[:400] or "no output",
         )
         return False
 
     def files(self, account: Account, pattern: str = "") -> str:
-        args = ["kernels", "files", account.ref, "--page-size", "200"]
+        args = ["kernels", "files", self.config.kernel_ref(account.username), "--page-size", "200"]
         return self.run(account, *args).stdout
 
     def output(self, account: Account, pattern: str, destination: Path) -> Path:
         destination.mkdir(parents=True, exist_ok=True)
-        args = ["kernels", "output", account.ref, "-p", str(destination), "-o", "-q"]
+        args = [
+            "kernels",
+            "output",
+            self.config.kernel_ref(account.username),
+            "-p",
+            str(destination),
+            "-o",
+            "-q",
+        ]
         if pattern:
             args += ["--file-pattern", pattern]
         self.run(account, *args, timeout=300, check=False)

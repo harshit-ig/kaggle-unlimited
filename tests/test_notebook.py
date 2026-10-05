@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from kaggle_rotate.config import Config
+from kaggle_rotate.naming import slugify
 from kaggle_rotate.notebook import (
     FALLBACK_MODEL,
     FALLBACK_NUM_CTX,
@@ -316,6 +317,47 @@ def test_kernel_title_must_agree_with_the_kernel_slug():
     config.kernel.title = "Kaggle Rotate LlamaCPP"
     config.kernel.kernel_slug = "kaggle-rotate-llamacpp"
     assert kernel_metadata(config, _spec())["title"] == "Kaggle Rotate LlamaCPP"
+
+
+def test_metadata_id_and_title_slug_always_agree():
+    """Regression: `kernel_slug` used to be stored per account AND in config.
+
+    `kernel-metadata.json`'s `id` came from the account copy while `title` came from
+    config, so renaming only one produced a kernel whose id did not match the slug
+    Kaggle derives from its title -- and the push was rejected with nothing pointing at
+    the cause. The slug is now single-sourced through Config.kernel_ref().
+    """
+    config = _config()
+    ref = config.kernel_ref("harshitig")
+    metadata = kernel_metadata(config, _spec(kernel_ref=ref))
+    assert metadata["id"] == "harshitig/kaggle-rotate-llamacpp"
+    assert metadata["id"].split("/")[-1] == slugify(metadata["title"])
+
+
+def test_account_no_longer_carries_its_own_kernel_slug():
+    """Two sources of truth is the bug; assert the duplicate is gone, not just unused."""
+    from kaggle_rotate.accounts import Account
+
+    assert not hasattr(Account(slug="a", username="u"), "kernel_slug")
+
+
+def test_stored_kernel_slug_in_accounts_json_is_ignored():
+    """An existing accounts.json still carrying the old key must load, not explode."""
+    from kaggle_rotate.accounts import AccountStore
+
+    path = Path(__file__).parent / "_tmp_accounts.json"
+    path.write_text(
+        '{"a": {"slug": "a", "username": "u", "kind": "kaggle_json",'
+        ' "kernel_slug": "kaggle-rotate-ollama"}}'
+    )
+    try:
+        store = AccountStore(Config())
+        store.registry_path = path
+        loaded = store.load()
+        assert loaded["a"].username == "u"
+        assert not hasattr(loaded["a"], "kernel_slug")
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_launch_sidecar_records_the_credentials():

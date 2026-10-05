@@ -163,8 +163,8 @@ async def test_pool_rotates_across_accounts_and_moves_traffic(tmp_path: Path, st
     config.rotation.prewarm_lead_minutes = 60.0
 
     accounts = {
-        "acct0": Account(slug="acct0", username="user0", kernel_slug="krotate"),
-        "acct1": Account(slug="acct1", username="user1", kernel_slug="krotate"),
+        "acct0": Account(slug="acct0", username="user0"),
+        "acct1": Account(slug="acct1", username="user1"),
     }
 
     store = AccountStore(config)
@@ -316,7 +316,7 @@ async def test_a_slow_kaggle_probe_does_not_freeze_the_api(tmp_path: Path, slow_
     config.rotation.boot_timeout_seconds = 30.0
     config.kaggle.cli_timeout_seconds = 120.0
 
-    accounts = {"acct0": Account(slug="acct0", username="u0", kernel_slug="krotate")}
+    accounts = {"acct0": Account(slug="acct0", username="u0")}
     store = AccountStore(config)
     store.save(accounts)
 

@@ -167,6 +167,13 @@ you are most likely to want:
 
 Per-account weekly caps live in `~/.config/kaggle-rotate/accounts.json` (`weekly_limit_hours`).
 
+The kernel slug lives only in `kernel.kernel_slug` in `config.toml`. It used to be
+stored per account as well, and the two could disagree — which produced a
+`kernel-metadata.json` whose `id` did not match the slug Kaggle derives from the title,
+so the push was rejected with nothing pointing at the cause. An existing
+`accounts.json` carrying the old `kernel_slug` key still loads; the key is dropped with
+a warning.
+
 ## Inspecting what gets pushed
 
 ```bash

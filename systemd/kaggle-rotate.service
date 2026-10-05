@@ -1,0 +1,38 @@
+[Unit]
+Description=kaggle-rotate: rotating Kaggle GPU pool behind a local OpenAI endpoint
+Documentation=file:/home/elite/kaggle-unlimited/README.md
+# Start once the desktop session is up (network may still be settling; the pool has
+# its own launch backoff if it is not).
+After=graphical-session.target network-online.target
+# Stop when you log out, so closing the session tears the kernel down instead of
+# letting it run to Kaggle's 12h cap.
+PartOf=graphical-session.target
+# Do not let a crash-looping pool hammer the Kaggle API.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/home/elite/kaggle-unlimited
+ExecStart=/home/elite/kaggle-unlimited/.venv/bin/kaggle-rotate run
+
+# systemd user services do NOT inherit your shell PATH. Without this, the `kaggle`
+# subprocess the pool spawns for every status probe and kernel delete fails with
+# "kaggle: not found", and every kernel delete silently does nothing.
+Environment=PATH=/home/elite/kaggle-unlimited/.venv/bin:/home/elite/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+Restart=on-failure
+RestartSec=20
+
+# Shutdown has to delete the kernel, and `kaggle kernels delete` routinely takes
+# 60-150s. systemd's 90s default would SIGKILL us mid-delete and leave GPU time
+# billing against a kernel nobody is watching.
+KillSignal=SIGTERM
+TimeoutStopSec=420
+# Even if we exceed TimeoutStopSec, do not escalate to SIGKILL on the main process:
+# losing the process is acceptable, losing the delete is not.
+SendSIGKILL=no
+
+[Install]
+WantedBy=graphical-session.target

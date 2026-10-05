@@ -28,9 +28,20 @@ driver_grace_seconds = 120.0
 
 [rotation]
 session_limit_hours = 12.0
+# FALLBACK ONLY. Weekly remaining comes from Kaggle's own quota API (`kaggle quota`),
+# because it counts GPU time this tool never started: manual notebook runs, and anything
+# billed before the ledger existed. On a real account the local ledger reported 27.1h
+# left where Kaggle had 24.8h — the error was in the optimistic direction, which is the
+# dangerous one.
+#
+# This value is still the ceiling when an account sets none in accounts.json, and
+# `weekly_limit_hours` in accounts.json still overrides Kaggle's total per account.
 weekly_limit_hours = 30.0
 # GPU time held back so a warmed session always has somewhere to go.
 boot_reserve_hours = 1.5
+# How long a Kaggle quota reading stays usable. The loop ticks every 10s and a read
+# costs ~0.6s, so polling uncached would tax rotation for a number that moves slowly.
+quota_cache_seconds = 300.0
 # Start the next account this long before the active one hits its session cap.
 prewarm_lead_minutes = 120.0
 # Do not begin a session within this of a weekly cap.

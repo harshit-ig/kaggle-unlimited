@@ -45,6 +45,10 @@ elif args[:2] == ["kernels", "status"]:
     print("Status: RUNNING")
 elif args[:2] == ["kernels", "delete"]:
     print("deleted")
+elif args[:1] == ["quota"]:
+    print("resource,used,remaining,total,refreshAt")
+    print("GPU,1.00h,29.00h,30.00h,2030-01-01T00:00:00")
+    print("TPU,0.00h,20.00h,20.00h,2030-01-01T00:00:00")
 else:
     print("unsupported stub call: " + " ".join(args))
 """
@@ -223,7 +227,10 @@ async def test_pool_rotates_across_accounts_and_moves_traffic(tmp_path: Path, st
 
                 # The old kernel was told to stand down and its quota slot closed.
                 assert await _wait_for(lambda: pool.state.get(first).state == "stopped")
-                assert kernels[first].retired is True
+                # The slot is marked stopped as soon as retirement is decided; the kernel
+                # learns about it on the next supervisor poll. Assert on the signal the
+                # pool actually sends rather than on how fast the fake happens to notice.
+                assert await _wait_for(lambda: kernels[first].retired is True)
                 assert pool.ledger.find_live(first) is None
                 assert pool.ledger.used_hours(first) > 0
                 assert pool.ledger.find_live(second) is not None

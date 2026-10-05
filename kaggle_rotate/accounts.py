@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .config import Config
+from .quota import QuotaCache, QuotaSnapshot, QuotaUnavailable, parse_quota_csv
 
 log = logging.getLogger("kaggle_rotate.accounts")
 
@@ -413,3 +414,69 @@ class KaggleCLI:
         """Cheap auth probe: listing own kernels fails fast on bad credentials."""
         self.run(account, "kernels", "list", "--page-size", "1")
         return StatusResult(raw="ok", state="COMPLETE")
+
+    def quota(self, account: Account, timeout: float = 30.0) -> QuotaSnapshot:
+        """Blocking quota read for one-off CLI paths (`accounts`, `status`).
+
+        The pool must never call this: it would block the event loop, which reads to
+        clients as the API being down. Use aquota_cached() there.
+        """
+        try:
+            proc = self.run(account, "quota", "--csv", timeout=timeout, check=False)
+        except KaggleError as exc:
+            raise QuotaUnavailable(f"kaggle quota failed: {exc}") from exc
+        text = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode != 0:
+            raise QuotaUnavailable(f"kaggle quota exit {proc.returncode}: {text.strip()[:200]}")
+        snapshot = parse_quota_csv(text, account.slug)
+        if snapshot is None:
+            raise QuotaUnavailable(f"could not parse kaggle quota output: {text.strip()[:200]}")
+        return snapshot
+
+    async def aquota(self, account: Account, timeout: float = 30.0) -> QuotaSnapshot:
+        """Kaggle's authoritative weekly accelerator usage for `account`.
+
+        Preferred over the local ledger for budget decisions because it counts GPU time
+        this tool never started: manual notebook runs, and anything billed before the
+        ledger existed. On a real account the ledger reported 2.72h where Kaggle billed
+        5.03h, and the error was in the optimistic direction.
+
+        Raises QuotaUnavailable on any failure so callers can fall back deliberately
+        rather than reading a zero that looks like "no quota used".
+        """
+        argv = [self.config.kaggle.command, "quota", "--csv"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                env=self.store.env_for(account),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except (OSError, ValueError) as exc:
+            raise QuotaUnavailable(f"could not run kaggle quota: {exc}") from exc
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            raise QuotaUnavailable(f"kaggle quota timed out after {timeout}s") from exc
+
+        text = stdout.decode("utf-8", "replace")
+        if proc.returncode != 0:
+            raise QuotaUnavailable(f"kaggle quota exit {proc.returncode}: {text.strip()[:200]}")
+        snapshot = parse_quota_csv(text, account.slug)
+        if snapshot is None:
+            raise QuotaUnavailable(f"could not parse kaggle quota output: {text.strip()[:200]}")
+        return snapshot
+
+    async def aquota_cached(
+        self, account: Account, cache: QuotaCache, timeout: float = 30.0
+    ) -> QuotaSnapshot:
+        """aquota() with a TTL cache; the pool polls far more often than quota moves."""
+        cached = cache.cached(account.slug)
+        if cached is not None:
+            return cached
+        snapshot = await self.aquota(account, timeout=timeout)
+        cache.store(snapshot)
+        cache.reads += 1
+        return snapshot

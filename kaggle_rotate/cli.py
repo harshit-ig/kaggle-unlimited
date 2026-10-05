@@ -17,7 +17,7 @@ from .config import Config, load_config
 from .notebook import MODEL_BASE_URL, LaunchSpec, build_notebook, read_served_model
 from .pool import Pool
 from .proxy import UpstreamRouter
-from .quota import Ledger, utcnow, week_start
+from .quota import Ledger, QuotaUnavailable, utcnow, week_start
 from .relay import RelayState
 from .state import PidFile, PoolState
 
@@ -183,24 +183,49 @@ def cmd_add_account(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_accounts(args: argparse.Namespace, config: Config) -> int:
+    """Weekly quota per account, from Kaggle where possible.
+
+    Kaggle's number is the one that matters: it also counts GPU time this tool never
+    started. The local ledger only knows about its own sessions and therefore runs low,
+    so both are shown side by side rather than quietly preferring the flattering one.
+    """
     store = AccountStore(config)
     ledger = Ledger(config.resolved_state_dir() / "ledger.json")
     accounts = store.load()
     if not accounts:
         print("no accounts configured; run `kaggle-rotate init`")
         return 1
-    print(f"{'slug':<18}{'username':<24}{'kind':<14}{'used':>8}{'left':>8}  limit")
+    cli = KaggleCLI(config, store)
+    print(f"{'slug':<18}{'kaggle':>9}{'local':>9}{'limit':>8}  {'resets':<21}note")
+    any_reset = ""
     for account in accounts.values():
         limit = account.effective_weekly_limit(config.rotation.weekly_limit_hours)
-        used = ledger.used_hours(account.slug)
-        left = max(0.0, limit - used)
+        local_used = ledger.used_hours(account.slug)
+        local_left = max(0.0, limit - local_used)
+        note = ""
+        reset = ""
+        try:
+            snapshot = cli.quota(account)
+            reset = snapshot.refresh_at
+            any_reset = any_reset or reset
+            if local_used + 0.05 < snapshot.used_hours:
+                note = f"local under-counts by {snapshot.used_hours - local_used:.2f}h"
+            print(
+                f"{account.slug:<18}{snapshot.remaining_hours:>8.2f}h{local_left:>8.2f}h"
+                f"{limit:>7.2f}h  {(reset or '-'):<21}{note}"
+            )
+        except QuotaUnavailable as exc:
+            print(
+                f"{account.slug:<18}{'-':>9}{local_left:>8.2f}h{limit:>7.2f}h  {'-':<21}"
+                f"unavailable ({str(exc)[:36]})"
+            )
+    if any_reset:
+        print(f"\nKaggle quota resets {any_reset} (authoritative for the weekly limit)")
+    else:
         print(
-            f"{account.slug:<18}{account.username:<24}{account.kind:<14}"
-            f"{used:>7.2f}h{left:>7.2f}h  {limit:g}h"
+            f"\nKaggle quota reset unknown; local week started "
+            f"{week_start(utcnow()).isoformat()} (assumed Saturday 00:00 UTC)"
         )
-    print(
-        f"\nquota week started {week_start(utcnow()).isoformat()} (Kaggle resets Saturday 00:00 UTC)"
-    )
     return 0
 
 
@@ -250,7 +275,8 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
         return 0
 
     print(
-        f"\n{'account':<16}{'state':<12}{'session':>10}{'left':>9}{'weekly':>9}{'w-left':>9}  model"
+        f"\n{'account':<16}{'state':<12}{'session':>10}{'left':>9}"
+        f"{'k-weekly':>10}{'l-weekly':>10}  model"
     )
     for name, slot in sorted(pool_state.slots.items()):
         account = accounts.get(name)
@@ -262,11 +288,20 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
         used = ledger.used_hours(name)
         live = ledger.find_live(name)
         elapsed = live.elapsed_hours() if live else 0.0
+        # Prefer the pool's last Kaggle reading; fall back to the local estimate, and
+        # say which one is on screen rather than passing an estimate off as fact.
+        if slot.kaggle_weekly_used_hours is not None:
+            kaggle = max(0.0, limit - slot.kaggle_weekly_used_hours)
+        else:
+            kaggle = float("nan")
+        kaggle_text = f"{kaggle:>9.2f}h" if kaggle == kaggle else f"{'n/a':>10}"
         print(
             f"{name:<16}{slot.state:<12}"
             f"{elapsed:>9.2f}h{config.rotation.session_limit_hours - elapsed:>8.2f}h"
-            f"{used:>8.2f}h{max(0.0, limit - used):>8.2f}h  {slot.model or '-'}"
+            f"{kaggle_text}{max(0.0, limit - used):>9.2f}h  {slot.model or '-'}"
         )
+    if any(s.kaggle_weekly_used_hours is None for s in pool_state.slots.values()):
+        print("  k-weekly: no Kaggle reading yet; l-weekly is a local estimate")
     return 0
 
 

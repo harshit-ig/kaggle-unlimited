@@ -26,6 +26,14 @@ class SlotState:
     detail: str = ""
     last_attempt: float = 0.0
     attempts: int = 0
+    # Kaggle's own weekly accelerator usage for this account, when the pool has been
+    # able to read it. The ledger cannot see GPU time this tool did not start, so these
+    # are the figures a budget decision should be based on.
+    kaggle_weekly_used_hours: float | None = None
+    kaggle_weekly_remaining_hours: float | None = None
+    kaggle_quota_refresh_at: str = ""
+    # "kaggle" once a real reading is available, otherwise "ledger".
+    quota_source: str = "ledger"
 
     def to_public(self) -> dict[str, Any]:
         data = asdict(self)

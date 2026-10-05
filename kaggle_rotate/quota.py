@@ -78,7 +78,11 @@ class Session:
 
     def elapsed_hours(self, now: datetime | None = None) -> float:
         now = now or utcnow()
-        return hours((min(now, self.end) if self.end else now - self.start).total_seconds())
+        # A session cannot have run past its own end time, but it also cannot have run
+        # for a negative span if the clock moved. Clamp both ends so the arithmetic is
+        # always a timedelta.
+        end = min(now, self.end) if self.end else now
+        return hours(max(0.0, (end - self.start).total_seconds()))
 
     def to_public(self, now: datetime | None = None) -> dict:
         return {
@@ -250,13 +254,165 @@ class Budget:
         account_limit: float = 0.0,
         reserve_hours: float = 0.0,
         now: datetime | None = None,
+        kaggle_remaining: float | None = None,
+        kaggle_used: float | None = None,
     ) -> tuple[bool, str]:
-        remaining = self.weekly_remaining_hours(ledger, account, account_limit, now)
+        """May this account start a session?
+
+        `kaggle_remaining` is Kaggle's own "hours left this week" when we have one, and
+        it is preferred because it counts GPU time this tool did not start; the ledger
+        only knows about its own sessions and therefore under-counts. The fallback is
+        the ledger, which fails open on purpose: a quota-API outage must not strand a
+        healthy account behind a working endpoint. That choice can overshoot a real cap,
+        so callers log whenever the fallback is used.
+
+        A per-account `account_limit` overrides Kaggle's total, so an operator can cap an
+        account below what Kaggle would allow. That needs `kaggle_used` rather than
+        `kaggle_remaining`, because remaining-under-a-cap is derived from used time --
+        capping "what's left" directly would silently ignore the cap whenever Kaggle's
+        own allowance was the smaller number.
+        """
+        local = self.weekly_remaining_hours(ledger, account, account_limit, now)
+        if account_limit and kaggle_used is not None:
+            remaining = max(0.0, account_limit - kaggle_used)
+        elif kaggle_remaining is not None:
+            remaining = kaggle_remaining
+        else:
+            remaining = local
+
         needed = max(0.0, reserve_hours)
         if remaining <= 0:
-            return False, f"weekly quota exhausted ({remaining:.2f}h left)"
+            source = "kaggle" if kaggle_remaining is not None else "ledger"
+            return False, f"weekly quota exhausted ({remaining:.2f}h left, from {source})"
         if needed and remaining < needed:
             return False, f"only {remaining:.2f}h of weekly quota left, {needed:.2f}h reserved"
         if ledger.find_live(account) is not None:
             return False, "account already has a live session"
         return True, f"{remaining:.2f}h of weekly quota left"
+
+
+@dataclass
+class QuotaSnapshot:
+    """Kaggle's own accelerator accounting for one account.
+
+    This is ground truth: it includes GPU time this tool did not start, which is why
+    the local ledger alone is not safe for budget decisions. Measured on a real account,
+    the ledger under-counted 5.03 billed hours as 2.72h of wall time.
+
+    `fetched_at` is stamped on construction unless a caller supplies one, so a snapshot
+    is always timestamped even when it is built by hand in a test or a parse.
+    """
+
+    account: str
+    used_hours: float
+    remaining_hours: float
+    total_hours: float
+    # When Kaggle says the weekly counter resets. Preferred over assuming Saturday 00:00.
+    refresh_at: str = ""
+    fetched_at: float = field(default_factory=lambda: utcnow().timestamp())
+    # How old this reading is. Recomputed on cache hits; a hand-built snapshot is fresh.
+    age_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.used_hours < 0:
+            self.used_hours = 0.0
+        # Kaggle can report a used total above the allowance (e.g. a shortened week), so
+        # clamp `remaining` rather than let it read negative, but keep `used` intact so
+        # an overage is still visible.
+        self.remaining_hours = max(0.0, self.remaining_hours)
+
+    def to_public(self) -> dict:
+        return {
+            "account": self.account,
+            "used_hours": round(self.used_hours, 4),
+            "remaining_hours": round(self.remaining_hours, 4),
+            "total_hours": round(self.total_hours, 4),
+            "refresh_at": self.refresh_at,
+            "age_seconds": round(self.age_seconds, 1),
+        }
+
+
+class QuotaUnavailable(Exception):
+    """Kaggle's quota API could not be read. Callers fall back to the local ledger."""
+
+
+def parse_quota_csv(text: str, account: str) -> QuotaSnapshot | None:
+    """Parse `kaggle quota --csv`.
+
+    The CSV is the stable contract here rather than the protobuf API: it is one
+    subprocess either way, and it does not add a kaggle-python dependency to the
+    subprocess path. Header is `resource,used,remaining,total,refreshAt`.
+    """
+    gpu: list[str] | None = None
+    refresh = ""
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if not parts or not parts[0]:
+            continue
+        if parts[0].lower() == "resource":
+            continue
+        if parts[0].upper() == "GPU" and gpu is None:
+            gpu = parts
+
+    def as_hours(value: str) -> float | None:
+        value = value.strip().upper()
+        if not value.endswith("H"):
+            return None
+        try:
+            return float(value[:-1])
+        except ValueError:
+            return None
+
+    if gpu is None or len(gpu) < 4:
+        return None
+    used = as_hours(gpu[1])
+    remaining = as_hours(gpu[2])
+    total = as_hours(gpu[3])
+    if used is None or remaining is None or total is None:
+        return None
+    if len(gpu) > 4 and gpu[4]:
+        refresh = gpu[4]
+    return QuotaSnapshot(
+        account=account,
+        used_hours=used,
+        remaining_hours=remaining,
+        total_hours=total,
+        refresh_at=refresh,
+    )
+
+
+class QuotaCache:
+    """Per-account cache of Kaggle's quota numbers, with an explicit failure signal.
+
+    The pool ticks every 10s and a quota read costs ~0.6s, so an uncached read per tick
+    per account would be a meaningful tax on the loop for a number that moves slowly.
+    Five minutes is short against a 30h budget and long enough to keep the cost flat.
+    """
+
+    def __init__(self, ttl_seconds: float = 300.0) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._entries: dict[str, QuotaSnapshot] = {}
+        self._lock = threading.Lock()
+        self.reads = 0
+        self.hits = 0
+        self.failures = 0
+
+    def cached(self, account: str) -> QuotaSnapshot | None:
+        with self._lock:
+            entry = self._entries.get(account)
+            if entry is None:
+                return None
+            age = utcnow().timestamp() - entry.fetched_at
+            if age > self.ttl_seconds:
+                return None
+            self.hits += 1
+            entry.age_seconds = age
+            return entry
+
+    def store(self, snapshot: QuotaSnapshot) -> None:
+        with self._lock:
+            self._entries[snapshot.account] = snapshot
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {"reads": self.reads, "hits": self.hits, "failures": self.failures}

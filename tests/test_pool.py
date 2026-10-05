@@ -27,6 +27,28 @@ class StubCLI:
         self.deleted: list[str] = []
         self.delete_attempts: list[str] = []
         self.status_state = "COMPLETE"
+        # None means "the quota API is unreachable", which is the fail-open path: the
+        # pool must fall back to the local ledger rather than refusing to start.
+        self.quota: float | None = None
+        self.quota_calls = 0
+
+    async def aquota_cached(self, account, cache, timeout=None):
+        from kaggle_rotate.quota import QuotaSnapshot, QuotaUnavailable
+
+        self.quota_calls += 1
+        cached = cache.cached(account.slug)
+        if cached is not None:
+            return cached
+        if self.quota is None:
+            raise QuotaUnavailable("stub: quota unavailable")
+        snapshot = QuotaSnapshot(
+            account=account.slug,
+            used_hours=30.0 - self.quota,
+            remaining_hours=self.quota,
+            total_hours=30.0,
+        )
+        cache.store(snapshot)
+        return snapshot
 
     def status(self, account: Account):
         from kaggle_rotate.accounts import StatusResult
@@ -87,13 +109,13 @@ def test_weekly_near_cap_triggers_prewarm(tmp_path: Path):
     assert pool._should_prewarm(pool.state.get("acct0")) is True
 
 
-async def test_first_session_goes_to_the_account_with_most_quota(tmp_path: Path):
+def test_first_session_goes_to_the_account_with_most_quota(tmp_path: Path):
     accounts = _accounts(3)
     pool = _pool(tmp_path, accounts)
     spent = pool.ledger.open_session("acct2", "acct2/krotate", now=utcnow() - timedelta(hours=10))
     pool.ledger.close_session(spent, "done")
 
-    chosen = pool._pick_launch_target()
+    chosen = asyncio.run(pool._pick_launch_target())
     assert chosen is not None
     assert chosen.slug in {"acct0", "acct1"}
     # acct2 has 20h left, the others 30h; tie broken by iteration order.
@@ -107,7 +129,7 @@ def test_exhausted_accounts_are_skipped(tmp_path: Path):
             slug, f"{slug}/krotate", now=utcnow() - timedelta(hours=31)
         )
         pool.ledger.close_session(spent, "done")
-    assert pool._pick_launch_target() is None
+    assert asyncio.run(pool._pick_launch_target()) is None
 
 
 async def test_concurrent_kernel_cap_is_respected(tmp_path: Path):
@@ -117,7 +139,7 @@ async def test_concurrent_kernel_cap_is_respected(tmp_path: Path):
     assert pool._live_kernel_count() == 1
     pool.state.update("acct1", state="booting")
     assert pool._live_kernel_count() == 2
-    assert pool._pick_launch_target() is None
+    assert await pool._pick_launch_target() is None
 
 
 async def test_cutover_moves_traffic_to_the_warmed_account(tmp_path: Path):
@@ -230,12 +252,12 @@ async def test_coverage_gap_is_reported_once_per_distinct_reason(tmp_path: Path)
     pool = _pool(tmp_path, _accounts(1))
     pool.state.update("acct0", state="failed", attempts=1, last_attempt=time.time())
 
-    assert pool._pick_launch_target() is None
+    assert await pool._pick_launch_target() is None
     first = pool._coverage_note
     assert "backing off" in first
 
     for _ in range(5):
-        pool._pick_launch_target()
+        await pool._pick_launch_target()
     assert pool._coverage_note == first
 
 
@@ -244,7 +266,7 @@ def test_coverage_note_explains_quota_exhaustion(tmp_path: Path):
     for slug in ("acct0", "acct1"):
         spent = pool.ledger.open_session(slug, f"{slug}/k", now=utcnow() - timedelta(hours=31))
         pool.ledger.close_session(spent, "done")
-    assert pool._pick_launch_target() is None
+    assert asyncio.run(pool._pick_launch_target()) is None
     assert pool._coverage_note.count("weekly quota exhausted") == 2
 
 

@@ -47,8 +47,18 @@ class RelayConfig:
 class RotationConfig:
     session_limit_hours: float = 12.0
     weekly_limit_hours: float = 30.0
+    # Fallback only. Weekly remaining comes from Kaggle's own quota API when it is
+    # reachable, because it counts GPU sessions this tool never started (manual notebook
+    # runs, anything billed before the ledger existed). The local ledger under-counted a
+    # real account by 46%, in the optimistic direction.
+    #
+    # `weekly_limit_hours` is still used as the ceiling when an account sets none, and
+    # `weekly_limit_hours` in accounts.json still overrides Kaggle's total per account.
     # Reserve GPU time for the *next* boot so a warmed session always has headroom.
     boot_reserve_hours: float = 1.5
+    # How long a Kaggle quota reading stays usable. The loop ticks every 10s and a read
+    # costs ~0.6s, so polling uncached would tax rotation for a number that moves slowly.
+    quota_cache_seconds: float = 300.0
     # Start the next account this long before the active one hits its session cap.
     prewarm_lead_minutes: float = 120.0
     # Stop launching a session if it would begin within this of a weekly cap.

@@ -29,7 +29,7 @@ from .accounts import Account, KaggleCLI
 from .config import Config
 from .notebook import HEALTH_PATH, LaunchSpec, read_served_model, write_kernel
 from .proxy import ProxyApp, Upstream, UpstreamRouter
-from .quota import Budget, Ledger, hours
+from .quota import Budget, Ledger, QuotaCache, QuotaSnapshot, QuotaUnavailable, hours
 from .relay import RelayState
 from .state import PoolState, SlotState
 from .tunnel import Tunnel, ensure_cloudflared, start_quick_tunnel, wait_reachable
@@ -86,6 +86,9 @@ class Pool:
             session_limit_hours=config.rotation.session_limit_hours,
             weekly_limit_hours=config.rotation.weekly_limit_hours,
         )
+        # Kaggle's quota moves slowly and a read costs ~0.6s, but the loop ticks every
+        # 10s. Without this the read becomes a measurable tax on rotation.
+        self.quota_cache = QuotaCache(ttl_seconds=config.rotation.quota_cache_seconds)
         self.proxy = ProxyApp(
             router,
             retry_on_standby=config.proxy.retry_on_standby,
@@ -361,12 +364,12 @@ class Pool:
         active_slot = self._active_slot()
 
         if active_slot is None:
-            if self._pick_launch_target(force_if_idle=True) is None:
+            if await self._pick_launch_target(force_if_idle=True) is None:
                 self._log_coverage_gap()
             return
 
         if self._should_prewarm(active_slot):
-            if self._pick_launch_target() is None:
+            if await self._pick_launch_target() is None:
                 self._log_coverage_gap()
 
     def _log_coverage_gap(self) -> None:
@@ -395,12 +398,75 @@ class Pool:
             if session_left <= rotation.prewarm_lead_minutes / 60.0:
                 return True
 
-        weekly_left = self.budget.weekly_remaining_hours(
-            self.ledger,
-            active.account,
-            account.effective_weekly_limit(rotation.weekly_limit_hours),
-        )
+        # Prefer Kaggle's last reading; fall back to the ledger if there is none yet.
+        # Prewarming early is cheap (the boot reserve exists for exactly this), while
+        # prewarming late strands clients, so this errs toward acting on real numbers.
+        snapshot = self.quota_cache.cached(account.slug)
+        if snapshot is not None:
+            weekly_left = self._remaining_for(account, snapshot)
+        else:
+            weekly_left = self.budget.weekly_remaining_hours(
+                self.ledger,
+                active.account,
+                account.effective_weekly_limit(rotation.weekly_limit_hours),
+            )
         return weekly_left <= rotation.boot_reserve_hours + rotation.weekly_safety_minutes / 60.0
+
+    async def _billed_delta(self, account: Account) -> float | None:
+        """GPU hours Kaggle actually billed across this session, if measurable.
+
+        Recorded on close so the ledger stops being purely an estimate. It is the delta
+        of the account's weekly total across the session's lifetime, which is exact for
+        a single-account pool but includes any concurrent manual run -- acceptable,
+        since the alternative is no measured figure at all. `billed_hours` staying None
+        means the quota API was unavailable, not that nothing was billed.
+        """
+        live = self.ledger.find_live(account.slug)
+        if live is None:
+            return None
+        try:
+            before = self.quota_cache.cached(account.slug)
+            after = await self.cli.aquota_cached(account, self.quota_cache)
+        except QuotaUnavailable:
+            return None
+        if before is None:
+            return None
+        delta = after.used_hours - before.used_hours
+        if delta < 0:
+            # The weekly counter reset underneath us; the delta is meaningless.
+            return None
+        return round(delta, 4)
+
+    async def _kaggle_quota(self, account: Account) -> QuotaSnapshot | None:
+        """Kaggle's weekly quota for `account`, or None if it could not be read.
+
+        None means "fall back to the local ledger", which is a deliberate fail-open: a
+        quota-API outage must not strand a healthy account behind a working endpoint.
+        The cost of that choice is that it can overshoot a real cap, so a fallback is
+        logged rather than happening silently.
+        """
+        try:
+            return await self.cli.aquota_cached(account, self.quota_cache)
+        except QuotaUnavailable as exc:
+            self.quota_cache.failures += 1
+            log.warning(
+                "%s: Kaggle quota unavailable (%s); falling back to the local ledger, "
+                "which counts only sessions this tool started",
+                account.slug,
+                exc,
+            )
+            return None
+
+    def _remaining_for(self, account: Account, snapshot: QuotaSnapshot) -> float:
+        """Remaining weekly hours under any operator cap, from Kaggle's numbers.
+
+        An explicit per-account cap overrides Kaggle's own allowance. It has to be
+        derived from *used* hours: capping "what's left" directly would ignore the cap
+        whenever Kaggle's allowance happened to be the smaller of the two.
+        """
+        if account.weekly_limit_hours:
+            return max(0.0, account.weekly_limit_hours - snapshot.used_hours)
+        return snapshot.remaining_hours
 
     def _live_kernel_count(self) -> int:
         return len(
@@ -411,7 +477,7 @@ class Pool:
             ]
         )
 
-    def _pick_launch_target(self, force_if_idle: bool = False) -> Account | None:
+    async def _pick_launch_target(self, force_if_idle: bool = False) -> Account | None:
         """Start a session on whichever account has the most weekly budget left."""
         rotation = self.config.rotation
         if self._live_kernel_count() >= rotation.max_active_sessions + 1:
@@ -434,21 +500,33 @@ class Pool:
                 # time, and a moving value would defeat note de-duplication.
                 skipped.append(f"{account.slug}: backing off after a failed launch")
                 continue
+            snapshot = await self._kaggle_quota(account)
             ok, reason = self.budget.can_start(
                 self.ledger,
                 account.slug,
                 account_limit=account.effective_weekly_limit(rotation.weekly_limit_hours),
                 reserve_hours=rotation.boot_reserve_hours if not force_if_idle else 0.0,
+                kaggle_remaining=None if snapshot is None else snapshot.remaining_hours,
+                kaggle_used=None if snapshot is None else snapshot.used_hours,
             )
             if not ok:
                 skipped.append(f"{account.slug}: {reason}")
                 continue
-            remaining = self.budget.weekly_remaining_hours(
-                self.ledger,
-                account.slug,
-                account.effective_weekly_limit(rotation.weekly_limit_hours),
-            )
-            candidates.append((remaining, account))
+            # Rank by the same number can_start just approved, so the account with the
+            # most real headroom wins rather than the one our ledger thinks is biggest.
+            if snapshot is not None:
+                candidates.append((self._remaining_for(account, snapshot), account))
+            else:
+                candidates.append(
+                    (
+                        self.budget.weekly_remaining_hours(
+                            self.ledger,
+                            account.slug,
+                            account.effective_weekly_limit(rotation.weekly_limit_hours),
+                        ),
+                        account,
+                    )
+                )
 
         self._coverage_note = "; ".join(skipped) or "no enabled accounts"
         if not candidates:
@@ -712,7 +790,8 @@ class Pool:
 
         live = self.ledger.find_live(account_slug)
         if live is not None:
-            self.ledger.close_session(live, reason)
+            billed = await self._billed_delta(account)
+            self.ledger.close_session(live, reason, billed_hours=billed)
 
         if not deleted:
             # Do not report a stop that did not happen: the kernel is still billing.
@@ -805,9 +884,17 @@ class Pool:
             )
             entry = slot.to_public()
             live = self.ledger.find_live(slot.account)
-            entry["weekly_used_hours"] = self.ledger.used_hours(slot.account)  # noqa: E501
+            entry["weekly_used_hours"] = self.ledger.used_hours(slot.account)
             entry["weekly_limit_hours"] = limit
             entry["weekly_remaining_hours"] = max(0.0, limit - entry["weekly_used_hours"])
+            # The last quota reading this pool took, so `status` can show the real
+            # figure alongside the local estimate instead of only the flattering one.
+            snapshot = self.quota_cache.cached(slot.account)
+            if snapshot is not None:
+                entry["kaggle_weekly_used_hours"] = round(snapshot.used_hours, 4)
+                entry["kaggle_weekly_remaining_hours"] = round(snapshot.remaining_hours, 4)
+                entry["kaggle_quota_refresh_at"] = snapshot.refresh_at
+            entry["quota_source"] = "kaggle" if snapshot is not None else "ledger"
             entry["session_remaining_hours"] = (
                 round(rotation.session_limit_hours - live.elapsed_hours(), 3)
                 if live is not None

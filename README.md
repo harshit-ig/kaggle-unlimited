@@ -58,7 +58,7 @@ Non-interactive equivalent: `uv run kaggle-rotate add-account bob --credential ~
 ```bash
 uv run kaggle-rotate run            # foreground; Ctrl-C stops and cleans up
 uv run kaggle-rotate status         # sessions, budgets, remaining session time
-uv run kaggle-rotate accounts       # weekly quota per account
+uv run kaggle-rotate accounts       # weekly quota: Kaggle's figure vs the local estimate
 uv run kaggle-rotate stop           # stop a backgrounded pool
 ```
 
@@ -225,8 +225,15 @@ uv run kaggle-rotate cleanup        # delete it
   `rotation.prewarm_lead_minutes` at its 120-minute default has ample room. Re-measure
   if you swap in a bigger model or a slower accelerator; `rotation.boot_timeout_seconds`
   (2400) has to cover the whole build.
-- **Weekly quota is estimated from wall time**, since Kaggle only reports real GPU
-  seconds after a session ends. Slight over-counting is deliberate.
+- **Weekly quota comes from Kaggle's own API** (`kaggle quota`), read every
+  `rotation.quota_cache_seconds`. It also counts GPU time this tool never started —
+  manual notebook runs, and anything billed before the ledger existed — which the
+  local ledger structurally cannot see. On a real account the two disagreed by 2.32h
+  and the ledger was the flattering one, which is the dangerous direction for a
+  budget check. `accounts` prints both so the gap stays visible.
+- **A quota-read failure falls back to the ledger, deliberately.** Refusing to start on
+  an API error would strand a working account behind a live endpoint; the cost is that
+  a fallback can overshoot a real cap, so it is logged every time it happens.
 - **Boot is a compiler build, not a package install.** Each session clones
   `Bonsai-demo` and builds it with CUDA, then pulls 7.2 GB. A published Kaggle dataset
   holding the compiled runtime and the GGUF would cut this further, though at ~7 minutes

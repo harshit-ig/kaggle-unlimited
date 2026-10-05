@@ -36,6 +36,11 @@ class RelayConfig:
     # Extra hostnames/urls to use instead of a quick tunnel (e.g. a named tunnel you
     # already expose). If set, `expose` is ignored.
     public_url: str = ""
+    # How long the relay waits without a pulse from the pool before it tells kernels
+    # the driver is gone. A relay can outlive its pool (orphaned cloudflared), and a
+    # kernel that keeps getting replies from a driverless relay would never notice it
+    # had been abandoned.
+    driver_grace_seconds: float = 120.0
 
 
 @dataclass
@@ -71,9 +76,15 @@ class KernelConfig:
     is_private: bool = True
     # Notebook this derives its model/ctx settings from.
     source_notebook: str = "qwen38_27b_kaggle_ollama_mtp_clean_64k.ipynb"
-    # Empty strings mean "inherit from source_notebook".
-    source_model: str = ""
+    # Name clients send, e.g. "qwen3:30b-a3b" or "my-model:8b".
     model: str = ""
+    # Hugging Face GGUF to download and derive from, e.g. "hf.co/user/repo:Q4_K_M".
+    # Only used when derive_model is true.
+    source_model: str = ""
+    # True: download source_model and derive `model` from it (MTP speculative decoding).
+    # False: `model` already exists in the Ollama library, so just pull it.
+    # None (default): infer from the model reference.
+    derive_model: bool | None = None
     num_ctx: int = 65536
     draft_num_predict: int = 2
     # Notebook self-terminates before Kaggle's hard cap so quota is never wasted.

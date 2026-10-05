@@ -36,6 +36,8 @@ class SourceModel:
     model: str = ""
     num_ctx: int = 65536
     draft_num_predict: int = 2
+    # False when the model is already published in the Ollama library.
+    derive_model: bool = True
 
 
 def _assignment(source: str, name: str) -> str | None:
@@ -67,6 +69,12 @@ def load_source_config(path: Path) -> SourceModel:
 
 
 def resolve_model_config(config: Config) -> SourceModel:
+    """Work out which model to serve.
+
+    Precedence: explicit config, then whatever the source notebook declares.
+    `derive_model` is auto-detected from the model reference unless set explicitly,
+    so `model = "qwen3:30b-a3b"` works with no further ceremony.
+    """
     source = load_source_config(config.resolved_source_notebook())
     if config.kernel.source_model:
         source.source_model = config.kernel.source_model
@@ -74,6 +82,13 @@ def resolve_model_config(config: Config) -> SourceModel:
         source.model = config.kernel.model
     source.num_ctx = config.kernel.num_ctx or source.num_ctx
     source.draft_num_predict = config.kernel.draft_num_predict or source.draft_num_predict
+
+    if config.kernel.derive_model is None:
+        # A colon tag (and no hf.co prefix) means an Ollama library reference, which
+        # must not go through the HF download + derive path.
+        source.derive_model = not (source.model and is_library_ref(source.model))
+    else:
+        source.derive_model = config.kernel.derive_model
     return source
 
 
@@ -95,6 +110,47 @@ DROP_MARKDOWN_MARKERS = (
 
 # Code cells after these are hard-cut: everything from here on is exposure/UI code.
 CUTOFF_CODE_MARKERS = ("cloudflared", "PUBLIC_OLLAMA_URL")
+
+# The source notebook hardcodes the served model in an environment cell and a later
+# cell derives from it. A config override has to reach *those* cells, not just the
+# cells this tool appends, or the notebook would create and load the old model.
+ASSIGNMENT_PLACEHOLDERS = {
+    "SOURCE_MODEL": "SOURCE_MODEL",
+    "MTP_MODEL": "MODEL",
+    "NUM_CTX": "NUM_CTX",
+    "DRAFT_TOKENS": "DRAFT",
+}
+
+
+def _rewrite_assignments(source: str) -> str:
+    """Turn `SOURCE_MODEL = "hf.co/..."` into `SOURCE_MODEL = "@SOURCE_MODEL@"`.
+
+    The original quoting has to survive, otherwise a substituted string literal turns
+    into bare text and the cell stops parsing.
+    """
+    for name, placeholder in ASSIGNMENT_PLACEHOLDERS.items():
+        quoted = re.compile(rf"^(\s*{name}\s*=\s*)([\"'])(.*?)([\"'])([^\n]*)$", re.MULTILINE)
+        source = quoted.sub(rf"\g<1>\g<2>@{placeholder}@\g<4>\g<5>", source)
+        bare = re.compile(rf"^(\s*{name}\s*=\s*)(?!\s*[\"'])(\S+)(\s*#.*)?$", re.MULTILINE)
+        source = bare.sub(rf"\g<1>@{placeholder}@\g<3>", source)
+    return source
+
+
+# A code cell that derives a model from a parent via /api/create. Skipped when the
+# chosen model already exists in the Ollama library.
+DERIVE_CELL_MARKER = "/api/create"
+
+
+def is_library_ref(model: str) -> bool:
+    """True for an Ollama library reference such as `qwen3:30b-a3b`.
+
+    Hugging Face GGUF references look like `hf.co/user/repo:Q4_K_M` and are not
+    library refs, because Ollama has to be told to download them from HF.
+    """
+    if model.startswith(("hf.co/", "hf://")):
+        return False
+    return ":" in model.rsplit("/", 1)[-1]
+
 
 _SHELL_LINE = re.compile(r"^\s*!(?P<cmd>.+)$")
 _BIN_VAR = "{OLLAMA_BIN}"
@@ -127,7 +183,9 @@ def _rewrite_shell_cell(source: str) -> str:
     return "\n".join(rewritten)
 
 
-def extract_setup_cells(notebook: dict[str, Any]) -> list[dict[str, Any]]:
+def extract_setup_cells(
+    notebook: dict[str, Any], *, skip_derive: bool = False
+) -> list[dict[str, Any]]:
     """Keep the source notebook's setup cells, dropping UI/demo code we replace."""
     kept: list[dict[str, Any]] = []
     dropping_code = False
@@ -146,8 +204,12 @@ def extract_setup_cells(notebook: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if any(marker in source for marker in CUTOFF_CODE_MARKERS):
             break
+        # Deriving a variant is meaningless for a model that is already published.
+        if skip_derive and DERIVE_CELL_MARKER in source:
+            continue
         rewritten = dict(cell)
-        rewritten["source"] = _rewrite_shell_cell(source).splitlines(keepends=True)
+        source = _rewrite_assignments(_rewrite_shell_cell(source))
+        rewritten["source"] = source.splitlines(keepends=True)
         kept.append(rewritten)
 
     # A header immediately before the cutoff would dangle without its section.
@@ -174,13 +236,16 @@ class LaunchSpec:
     max_runtime_seconds: float
     shutdown_poll_seconds: float
     orphan_grace_seconds: float = 900.0
+    # False for a model that already exists in the Ollama library: no HF download and
+    # no derived variant, just `ollama pull`.
+    derive_model: bool = True
     status_path: str = "/kaggle/working/kaggle-rotate"
 
 
-def _fill(template: str, values: dict[str, str]) -> str:
+def _fill(template: str, values: dict[str, Any]) -> str:
     out = template
     for key, value in values.items():
-        out = out.replace(f"@{key}@", value)
+        out = out.replace(f"@{key}@", str(value))
     return out
 
 
@@ -196,6 +261,18 @@ import time as _time
 import urllib.error as _urllib_error
 import urllib.request as _urllib_request
 from pathlib import Path as _Path
+
+def _uptime():
+    """Seconds since boot INCLUDING time spent suspended.
+
+    CLOCK_MONOTONIC stops while the machine is suspended, so a monotonic orphan timer
+    never fires after a suspend or hibernate and the kernel runs to its hard cap
+    instead. CLOCK_BOOTTIME keeps counting.
+    """
+    try:
+        return _time.clock_gettime(_time.CLOCK_BOOTTIME)
+    except (AttributeError, ValueError, OSError):
+        return _time.monotonic()
 
 def sh(cmd, env=None):
     """Run a shell command the way a `!`-prefixed notebook line would."""
@@ -271,9 +348,9 @@ _threading.Thread(
     target=_pipe, args=(_tunnel_process, _tunnel_out), daemon=True
 ).start()
 
-_deadline = _time.monotonic() + 90
+_deadline = _uptime() + 90
 PUBLIC_OLLAMA_URL = None
-while _time.monotonic() < _deadline:
+while _uptime() < _deadline:
     if _tunnel_process.poll() is not None and _tunnel_out.empty():
         break
     try:
@@ -290,6 +367,21 @@ if not PUBLIC_OLLAMA_URL:
     raise RuntimeError("Cloudflare quick tunnel did not produce a URL")
 
 print("Public model endpoint:", PUBLIC_OLLAMA_URL + "/v1", flush=True)
+"""
+
+LIBRARY_PULL_CELL = """\
+_pull_bin = _shutil.which("ollama")
+if not _pull_bin:
+    _subprocess.run(
+        "curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True
+    )
+    _pull_bin = _shutil.which("ollama")
+if not _pull_bin:
+    raise RuntimeError("ollama is not installed and could not be installed")
+
+_pull_env = globals().get("OLLAMA_ENV", _os.environ)
+print(f"pulling {_os.environ.get('MODEL_NAME', '@MODEL@')} from the Ollama library", flush=True)
+_subprocess.run([_pull_bin, "pull", "@MODEL@"], env=_pull_env, check=True)
 """
 
 PREWARM_CELL = """\
@@ -429,7 +521,8 @@ POLL_S = @POLL_S@
 ORPHAN_GRACE_S = @ORPHAN_GRACE@
 
 _stop_reason = None
-_last_relay_ok = _time.monotonic()
+_last_relay_ok = _uptime()
+_driver_lost_at = None
 _last_heartbeat = 0.0
 _deadline = SESSION_STARTED_AT + MAX_RUNTIME_S
 
@@ -461,18 +554,39 @@ while _stop_reason is None:
             },
             timeout=20,
         )
-        _last_heartbeat = _time.monotonic()
+        _last_heartbeat = _uptime()
         _last_relay_ok = _last_heartbeat
         _write_status({"phase": "serving", "ollama_alive": _ollama_alive()})
         action = command.get("action", "keepalive")
         if action == "shutdown":
             _stop_reason = command.get("reason", "shutdown requested by pool")
             break
+
+        # The relay can outlive the pool (an orphaned cloudflared child keeps
+        # answering). It is reachable but nobody is driving it, so nobody can rotate or
+        # retire this session - treat that exactly like a lost relay.
+        if not command.get("driver_alive", True):
+            if _driver_lost_at is None:
+                _driver_lost_at = _uptime()
+                print(
+                    "relay is answering but the local pool is gone "
+                    f"(silent {command.get('driver_silent_seconds', '?')}s); "
+                    f"self-terminating in {int(ORPHAN_GRACE_S)}s unless it returns",
+                    flush=True,
+                )
+            if _uptime() - _driver_lost_at > ORPHAN_GRACE_S:
+                _stop_reason = (
+                    "local pool disappeared while the relay stayed up; "
+                    "shutting down so the GPU is not billed unattended"
+                )
+                break
+        else:
+            _driver_lost_at = None
     except Exception as exc:
         print(f"relay heartbeat failed: {exc}", flush=True)
         _write_status({"phase": "serving", "relay_error": str(exc)})
 
-    if _time.monotonic() - _last_relay_ok > ORPHAN_GRACE_S:
+    if _uptime() - _last_relay_ok > ORPHAN_GRACE_S:
         _stop_reason = f"relay unreachable for {int(ORPHAN_GRACE_S)}s; shutting down"
         break
 
@@ -545,10 +659,14 @@ def build_notebook(config: Config, spec: LaunchSpec) -> dict[str, Any]:
     model.num_ctx = spec.num_ctx or model.num_ctx
     model.draft_num_predict = spec.draft_num_predict or model.draft_num_predict
 
+    derive = model.derive_model
+
     source_path = config.resolved_source_notebook()
     setup_cells: list[dict[str, Any]] = []
     if source_path.exists():
-        setup_cells = extract_setup_cells(json.loads(source_path.read_text()))
+        setup_cells = extract_setup_cells(
+            json.loads(source_path.read_text()), skip_derive=not derive
+        )
 
     values = dict(
         TOKEN=spec.token,
@@ -563,6 +681,8 @@ def build_notebook(config: Config, spec: LaunchSpec) -> dict[str, Any]:
         POLL_S=int(spec.shutdown_poll_seconds),
         ORPHAN_GRACE=int(spec.orphan_grace_seconds),
     )
+    # The placeholders substituted into the source notebook's own cells.
+    values["SOURCE_MODEL"] = model.source_model
 
     header = (
         f"# Managed by kaggle-rotate (account `{spec.account}`)\n\n"
@@ -574,8 +694,16 @@ def build_notebook(config: Config, spec: LaunchSpec) -> dict[str, Any]:
         f"- self-terminate after: `{spec.max_runtime_seconds / 3600:.2f}h`\n"
     )
 
+    header += f"- model source: {'derived from an HF GGUF' if derive else 'Ollama library'}\n"
+
     cells: list[dict[str, Any]] = [_markdown(header), _code(_replace(PREAMBLE, **values))]
-    cells += setup_cells
+    # The source notebook's cells carry their own copies of these placeholders.
+    cells += [
+        {**cell, "source": _fill("".join(cell["source"]), values).splitlines(keepends=True)}
+        for cell in setup_cells
+    ]
+    if not derive:
+        cells.append(_code(_replace(LIBRARY_PULL_CELL, **values)))
     cells += [
         _markdown("## Expose the model (Cloudflare quick tunnel)"),
         _code(_replace(TUNNEL_CELL, **values)),

@@ -12,6 +12,7 @@ quick tunnel in front of this app is not an open registration endpoint.
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -61,9 +62,27 @@ class RemoteSession:
 class RelayState:
     """Token-keyed registry of live kernels plus their pending commands."""
 
-    def __init__(self) -> None:
+    def __init__(self, driver_grace_seconds: float = 120.0) -> None:
         self._sessions: dict[str, RemoteSession] = {}
         self._lock = asyncio.Lock()
+        # Separate from any kernel token: only the pool may assert it is driving.
+        self.driver_token = secrets.token_urlsafe(32)
+        # The relay can outlive the pool (an orphaned cloudflared child answers for a
+        # while). A kernel that keeps getting replies from a driverless relay would
+        # never notice it had been orphaned, so the pool pulses and we report back
+        # whether it is still there.
+        self.driver_grace_seconds = driver_grace_seconds
+        self._last_pulse = time.time()
+
+    async def pulse(self) -> None:
+        async with self._lock:
+            self._last_pulse = time.time()
+
+    def driver_alive(self) -> bool:
+        return (time.time() - self._last_pulse) < self.driver_grace_seconds
+
+    def driver_silent_seconds(self) -> float:
+        return round(time.time() - self._last_pulse, 1)
 
     async def register(self, token: str, payload: dict[str, Any]) -> RemoteSession:
         async with self._lock:
@@ -164,6 +183,8 @@ def build_relay_app(state: RelayState) -> Starlette:
                 "action": session.command,
                 "reason": session.command_reason,
                 "session": session.to_public(),
+                "driver_alive": state.driver_alive(),
+                "driver_silent_seconds": state.driver_silent_seconds(),
             }
         )
 
@@ -193,6 +214,12 @@ def build_relay_app(state: RelayState) -> Starlette:
             }
         )
 
+    async def pulse(request: Request) -> JSONResponse:
+        if _bearer(request) != state.driver_token:
+            return JSONResponse({"error": "bad driver token"}, status_code=401)
+        await state.pulse()
+        return JSONResponse({"ok": True})
+
     async def sessions(request: Request) -> JSONResponse:
         if not _bearer(request):
             return JSONResponse({"error": "missing token"}, status_code=401)
@@ -218,6 +245,7 @@ def build_relay_app(state: RelayState) -> Starlette:
         routes=[
             Route("/healthz", healthz),
             Route("/_rot/register", register, methods=["POST"]),
+            Route("/_rot/pulse", pulse, methods=["POST"]),
             Route("/_rot/heartbeat", heartbeat, methods=["POST"]),
             Route("/_rot/final", final, methods=["POST"]),
             Route("/_rot/command", command, methods=["GET"]),

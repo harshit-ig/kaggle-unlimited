@@ -83,6 +83,40 @@ client.chat.completions.create(
 
 Raw Ollama endpoints work too: `http://127.0.0.1:8317/api/generate`.
 
+## Using a different model
+
+Set `model` in `config.toml`. Two kinds:
+
+```toml
+# 1. Any Ollama library model. Nothing to build - the notebook just pulls it.
+[kernel]
+model = "qwen3:30b-a3b"
+# also fine: "llama3.1:70b-instruct-q4_K_M", "deepseek-r1:14b", "gpt-oss:20b"
+
+# 2. A Hugging Face GGUF, derived into a local variant (what the shipped notebook
+#    does, so speculative decoding stays available).
+[kernel]
+model        = "qwen3.8-27b-uncensored-mtp"
+source_model = "hf.co/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF:Q4_K_M"
+```
+
+`derive_model` is inferred: a colon tag with no `hf.co/` prefix is treated as a
+library model. Set `derive_model = true` or `false` to override.
+
+Two things to know when switching:
+
+- **Library models get no speculative decoding.** `draft_num_predict` only applies to
+  a derived variant, so it is ignored on the library path.
+- **Your source notebook's own model assignment is rewritten**, not just this tool's
+  cells. Otherwise it would keep creating and loading the old model while the
+  prewarm cell waited for the new one that never arrives.
+
+Preview what would be pushed before spending quota:
+
+```bash
+uv run kaggle-rotate render --out /tmp/s.ipynb
+```
+
 ## How the handoff works
 
 Rotation is **prewarm-then-cutover**, never kill-then-restart:
@@ -118,6 +152,9 @@ you are most likely to want:
 | `rotation.idle_stop_minutes` | `0` | Set `30` to release the GPU when nothing is calling |
 | `rotation.weekly_limit_hours` | `30` | Kaggle's quota "is 30 hours or sometimes higher" — set what your account actually shows |
 | `kernel.accelerator` | `NvidiaTeslaT4` | `NvidiaTeslaT4` is 2× T4; also available: `NvidiaTeslaA100`, `NvidiaL4`, `NvidiaH100` |
+| `kernel.model` | *(from notebook)* | Serve a different model; library refs like `qwen3:30b-a3b` just work |
+| `kernel.derive_model` | *(inferred)* | `false` to pull a library model instead of deriving a variant |
+| `kernel.num_ctx` | `65536` | Lower it if the model will not fit alongside the KV cache |
 | `relay.public_url` | *(unset)* | Use a named Cloudflare tunnel instead of a quick tunnel |
 
 Per-account weekly caps live in `~/.config/kaggle-rotate/accounts.json` (`weekly_limit_hours`).
@@ -164,6 +201,10 @@ uv run kaggle-rotate cleanup        # delete it
 
 - **The first request after a cutover is not instant** for clients with a cold prefix
   cache; the *connection* never drops, but the new session's KV cache is empty.
+- **If the pool dies but its `cloudflared` child survives, the relay keeps answering**
+  and a kernel would never notice it had been abandoned. The pool now pulses the relay
+  every tick, the relay reports `driver_alive`, and a kernel that stops seeing pulses
+  shuts itself down after `kernel.orphan_grace_seconds`.
 - **Notebook boot time is the hard floor on lead time.** If a session fills its 12h
   and the next one needs 25 minutes to become resident, a short `prewarm_lead_minutes`
   guarantees a gap. 120 minutes is comfortable.

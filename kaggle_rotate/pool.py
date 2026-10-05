@@ -184,6 +184,7 @@ class Pool:
         self._tick_count += 1
         self.router.sweep()
         self._check_relay_tunnel()
+        await self._pulse_relay()
         await self._sync_relay_sessions()
         await self._refresh_status()
         await self._probe_all()
@@ -246,6 +247,23 @@ class Pool:
                     log.warning("upstream %s unhealthy", upstream.name)
 
     # ------------------------------------------------------------------ health
+
+    async def _pulse_relay(self) -> None:
+        """Tell the relay we are alive, so kernels can tell it from a zombie relay."""
+        if not self.relay_public_url or self._stopping:
+            return
+        if not self.relay_public_url.startswith("http"):
+            return  # nothing to point at
+        try:
+            await self._http.post(
+                f"{self.relay_public_url}/_rot/pulse",
+                headers={"Authorization": f"Bearer {self.relay_state.driver_token}"},
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            # The tunnel may be mid-reconnect; the next tick tries again. The notebook
+            # has its own orphan timer if this persists.
+            log.debug("relay pulse failed", exc_info=True)
 
     def _check_relay_tunnel(self) -> None:
         """A dead relay tunnel is unrecoverable, so say so loudly and early.

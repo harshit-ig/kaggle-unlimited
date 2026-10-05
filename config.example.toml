@@ -22,6 +22,9 @@ port = 8318
 expose = true
 tunnel_start_timeout = 90.0
 public_url = ""
+# How long the relay goes without a pulse from the pool before telling kernels the
+# driver is gone. Guards against a relay that outlives its pool.
+driver_grace_seconds = 120.0
 
 [rotation]
 session_limit_hours = 12.0
@@ -54,9 +57,29 @@ title = ""
 is_private = true
 # Notebook the model/ctx settings are read from.
 source_notebook = "qwen38_27b_kaggle_ollama_mtp_clean_64k.ipynb"
-# Empty = inherit from source_notebook.
-source_model = ""
+# ── Choosing a model ────────────────────────────────────────────────────────────
+# `model` is the name your client sends. Two flavours:
+#
+#   1. An Ollama library model. Just works, nothing to build:
+#        model = "qwen3:30b-a3b"
+#        model = "llama3.1:70b-instruct-q4_K_M"
+#        model = "deepseek-r1:14b"
+#      Nothing is derived; the notebook just `ollama pull`s it. Speculative decoding
+#      is off, since draft_num_predict only applies to a derived variant.
+#
+#   2. A Hugging Face GGUF, optionally derived into a local variant (this is what
+#      the shipped notebook does - it derives the MTP model from the base GGUF):
+#        model          = "qwen3.8-27b-uncensored-mtp"   # the derived name
+#        source_model   = "hf.co/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF:Q4_K_M"
+#
+# Left empty, both are inherited from source_notebook.
 model = ""
+source_model = ""
+# true  = download source_model and derive `model` from it
+# false = `model` is already in the Ollama library, so just pull it
+# unset = infer: a colon tag with no hf.co prefix is treated as a library model
+# omit this line entirely to auto-detect
+# derive_model = true
 num_ctx = 65536
 draft_num_predict = 2
 # Notebook self-terminates before Kaggle's hard cap.

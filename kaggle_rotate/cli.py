@@ -424,7 +424,7 @@ async def _run_pool(config: Config) -> int:
     state_dir = config.resolved_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    relay_state = RelayState()
+    relay_state = RelayState(driver_grace_seconds=config.relay.driver_grace_seconds)
     router = UpstreamRouter(drain_grace=config.proxy.drain_grace_seconds)
     pool = Pool(
         config=config,

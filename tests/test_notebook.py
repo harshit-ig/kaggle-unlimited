@@ -220,3 +220,116 @@ def test_rendered_notebook_still_parses_after_the_prewarm_change():
             pytest.fail(f"cell {index}: {exc}")
     blob = "\n".join(source for _, source in _code_cells(notebook))
     assert PLACEHOLDER.search(blob) is None
+
+
+# ── custom model selection ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("model", "library"),
+    [
+        ("qwen3:30b-a3b", True),
+        ("llama3.1:70b-instruct-q4_K_M", True),
+        ("deepseek-r1:14b", True),
+        ("hf.co/user/repo:Q4_K_M", False),
+        ("qwen3.8-27b-uncensored-mtp", False),
+        ("some/registry/path:Q4", True),
+    ],
+)
+def test_library_refs_are_detected(model: str, library: bool):
+    from kaggle_rotate.notebook import is_library_ref
+
+    assert is_library_ref(model) is library
+
+
+def test_derive_is_inferred_from_the_model_reference():
+    """`model = "qwen3:30b-a3b"` must work with no other ceremony."""
+    from kaggle_rotate.notebook import resolve_model_config
+
+    config = _config()
+    config.kernel.model = "qwen3:30b-a3b"
+    assert resolve_model_config(config).derive_model is False
+
+    config.kernel.model = "hf.co/user/repo:Q4_K_M"
+    assert resolve_model_config(config).derive_model is True
+
+
+def test_derive_can_be_forced_either_way():
+    from kaggle_rotate.notebook import resolve_model_config
+
+    config = _config()
+    config.kernel.model = "qwen3:30b-a3b"
+    config.kernel.derive_model = True  # a colon tag, but user wants the derive path
+    assert resolve_model_config(config).derive_model is True
+
+    config.kernel.derive_model = False
+    assert resolve_model_config(config).derive_model is False
+
+
+def test_default_is_unchanged():
+    """The shipped notebook keeps deriving MTP from the HF GGUF."""
+    from kaggle_rotate.notebook import resolve_model_config
+
+    resolved = resolve_model_config(_config())
+    assert resolved.model == "qwen3.8-27b-uncensored-mtp"
+    assert resolved.derive_model is True
+
+
+def test_source_notebook_assignments_are_rewritten_to_the_configured_model():
+    """Regression: the source notebook hardcodes the model in an environment cell and
+    a later cell derives from it. Changing only our own appended cells would have left
+    it creating and loading the old model."""
+    config = _config()
+    config.kernel.model = "qwen3:30b-a3b"
+    notebook = build_notebook(config, _spec(model="qwen3:30b-a3b"))
+    blob = "\n".join(source for _, source in _code_cells(notebook))
+    assert 'MTP_MODEL = "qwen3:30b-a3b"' in blob, "the source cell still hardcodes qwen"
+    assert "qwen3.8-27b-uncensored-mtp" not in blob
+
+
+def test_library_model_pulls_instead_of_deriving():
+    config = _config()
+    config.kernel.model = "qwen3:30b-a3b"
+    resolved = resolve_model_config(config)
+    notebook = build_notebook(
+        config,
+        _spec(model=resolved.model, derive_model=resolved.derive_model),
+    )
+    blob = "\n".join(source for _, source in _code_cells(notebook))
+    assert "/api/create" not in blob, "must not derive a variant of a library model"
+    assert '"pull"' in blob, "must pull the model from the library"
+    for index, source in _code_cells(notebook):
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:  # pragma: no cover
+            pytest.fail(f"cell {index}: {exc}")
+
+
+def test_hf_gguf_model_still_derives():
+    config = _config()
+    hf = "hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_M"
+    config.kernel.model = hf
+    config.kernel.source_model = hf
+    resolved = resolve_model_config(config)
+    assert resolved.derive_model is True
+    notebook = build_notebook(config, _spec(model=hf, source_model=hf, derive_model=True))
+    blob = "\n".join(source for _, source in _code_cells(notebook))
+    assert "/api/create" in blob
+    assert f'SOURCE_MODEL = "{hf}"' in blob
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('SOURCE_MODEL = "hf.co/a/b:Q4_K_M"', 'SOURCE_MODEL = "@SOURCE_MODEL@"'),
+        ('MTP_MODEL = "qwen3.8-27b-uncensored-mtp"', 'MTP_MODEL = "@MODEL@"'),
+        ("NUM_CTX = 65536", "NUM_CTX = @NUM_CTX@"),
+        ("DRAFT_TOKENS = 2", "DRAFT_TOKENS = @DRAFT@"),
+        ("DRAFT_TOKENS = 2  # comment", "DRAFT_TOKENS = @DRAFT@  # comment"),
+        ('SOMETHING_ELSE = "keep me"', 'SOMETHING_ELSE = "keep me"'),
+    ],
+)
+def test_assignment_rewrite_keeps_quotes_and_comments(line: str, expected: str):
+    from kaggle_rotate.notebook import _rewrite_assignments
+
+    assert _rewrite_assignments(line).strip() == expected

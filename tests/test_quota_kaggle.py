@@ -295,6 +295,32 @@ def test_ledger_and_kaggle_disagree_in_the_optimistic_direction(tmp_path: Path):
     assert kaggle.used_hours < total_wall, "in the measured case the ledger ran high"
 
 
+@pytest.mark.asyncio
+async def test_aquota_wraps_a_missing_binary_as_quota_unavailable():
+    config = Config()
+    config.kaggle.command = "/nonexistent/kaggle-does-not-exist"
+    store = type("S", (), {})()
+    store.env_for = lambda account: {}  # type: ignore[attr-defined]
+    cli = KaggleCLI(config=config, store=store)  # type: ignore[arg-type]
+    account = Account(slug="a", username="u")
+
+    with pytest.raises(QuotaUnavailable, match="could not run kaggle quota"):
+        await cli.aquota(account)
+
+
+def test_env_for_keeps_each_accounts_own_config_dir():
+    """The quota read must use the account's credentials, not a global one."""
+    from kaggle_rotate.accounts import Account, AccountStore
+
+    config = Config()
+    config.kaggle.config_root = "/tmp/kaggle-rotate-quota-test"
+    store = AccountStore(config)
+    account = Account(slug="acct", username="u", kind="kaggle_json")
+    env = store.env_for(account)
+    assert env["KAGGLE_CONFIG_DIR"].endswith("accounts/acct")
+    assert "KAGGLE_USERNAME" not in env, "stale ambient credentials must not leak in"
+
+
 def test_week_start_is_the_most_recent_saturday():
     start = week_start()
     assert start.weekday() == 5, "Saturday"

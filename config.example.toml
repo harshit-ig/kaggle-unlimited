@@ -51,37 +51,14 @@ launch_retry_max_seconds = 1800.0
 
 [kernel]
 accelerator = "NvidiaTeslaT4"
-kernel_slug = "kaggle-rotate-ollama"
+kernel_slug = "kaggle-rotate-llamacpp"
 # Must slugify to kernel_slug: Kaggle derives the kernel id from the title.
 title = ""
 is_private = true
-# Notebook the model/ctx settings are read from.
-source_notebook = "qwen38_27b_kaggle_ollama_mtp_clean_64k.ipynb"
-# ── Choosing a model ────────────────────────────────────────────────────────────
-# `model` is the name your client sends. Two flavours:
-#
-#   1. An Ollama library model. Just works, nothing to build:
-#        model = "qwen3:30b-a3b"
-#        model = "llama3.1:70b-instruct-q4_K_M"
-#        model = "deepseek-r1:14b"
-#      Nothing is derived; the notebook just `ollama pull`s it. Speculative decoding
-#      is off, since draft_num_predict only applies to a derived variant.
-#
-#   2. A Hugging Face GGUF, optionally derived into a local variant (this is what
-#      the shipped notebook does - it derives the MTP model from the base GGUF):
-#        model          = "qwen3.8-27b-uncensored-mtp"   # the derived name
-#        source_model   = "hf.co/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF:Q4_K_M"
-#
-# Left empty, both are inherited from source_notebook.
-model = ""
-source_model = ""
-# true  = download source_model and derive `model` from it
-# false = `model` is already in the Ollama library, so just pull it
-# unset = infer: a colon tag with no hf.co prefix is treated as a library model
-# omit this line entirely to auto-detect
-# derive_model = true
-num_ctx = 65536
-draft_num_predict = 2
+# Notebook the server is built from. It is also the source of truth for the model, the
+# weights and the context window, so there is no config key for any of those: to serve a
+# different model, point this at a notebook that loads it.
+source_notebook = "bonsai2_27b_pq2_0_kaggle_llamacpp.ipynb"
 # Notebook self-terminates before Kaggle's hard cap.
 max_runtime_minutes = 660.0
 shutdown_poll_seconds = 20.0

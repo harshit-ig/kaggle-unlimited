@@ -1,12 +1,17 @@
 # kaggle-rotate
 
-Runs your Ollama notebook on Kaggle, one account at a time, and **switches to the next
-account without your client noticing**. Clients talk to a single local URL; the pool
+Runs a self-hosted LLM notebook on Kaggle, one account at a time, and **switches to the
+next account without your client noticing**. Clients talk to a single local URL; the pool
 boots the next GPU session *before* retiring the current one and flips traffic across
 when the replacement is warm.
 
-Built around `qwen38_27b_kaggle_ollama_mtp_clean_64k.ipynb`: that notebook's setup
-cells are reused verbatim, so the model, context length, and MTP settings stay yours.
+Built around `bonsai2_27b_pq2_0_kaggle_llamacpp.ipynb`: that notebook's setup cells are
+reused verbatim, so the model, context length and server flags stay yours.
+
+The shipped notebook serves **Ternary Bonsai 2 27B (PQ2_0)** through PrismML's
+`llama.cpp` fork on `127.0.0.1:8080`, exposing an OpenAI-compatible API. There is no
+Ollama anywhere in the stack — the ternary `PQ2_0`/`PTQ1_0` tensor types are new ggml
+types that neither upstream `llama.cpp` nor Ollama can parse yet.
 
 ```
 your client (Cline / aider / Continue / OpenAI SDK)
@@ -21,8 +26,8 @@ your client (Cline / aider / Continue / OpenAI SDK)
         ┌───────────────────┴────────────────────┐
         ▼                                        ▼
   Kaggle kernel "acct-a"                  Kaggle kernel "acct-b"
-  ollama + cloudflared tunnel             ollama + cloudflared tunnel
-  (warming up, model not loaded yet)       (model resident, serving)
+  llama-server + cloudflared tunnel       llama-server + cloudflared tunnel
+  (warming up, weights still downloading)  (model resident, serving)
 ```
 
 ## Setup (once)
@@ -57,13 +62,16 @@ uv run kaggle-rotate accounts       # weekly quota per account
 uv run kaggle-rotate stop           # stop a backgrounded pool
 ```
 
-First boot downloads Ollama's runtime plus ~17 GB of weights and waits for a GPU, so
-expect 10–25 minutes before the endpoint answers. The pool prints a progress line for
-each stage; `run/kaggle-rotate.log` has the full history.
+First boot clones `PrismML-Eng/Bonsai-demo`, compiles it with CUDA, and pulls the
+7.2 GB `PQ2_0` GGUF, so expect **20–40 minutes** before the endpoint answers — this is a
+full compiler build, not a package install. The pool prints a progress line for each
+stage; `run/kaggle-rotate.log` has the full history. Subsequent sessions reuse the same
+notebook, so treat the first one as the slow one.
 
 ## Point your client at it
 
-Base URL `http://127.0.0.1:8317/v1`, any API key, model `qwen3.8-27b-uncensored-mtp`.
+Base URL `http://127.0.0.1:8317/v1`, any API key, model `ternary-bonsai-2-27b-pq2`
+(declared by the source notebook and reported by `kaggle-rotate status`).
 
 ```bash
 # OpenAI SDK / aider / Continue / Cline — all take the same three values
@@ -76,40 +84,41 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="anything")
 client.chat.completions.create(
-    model="qwen3.8-27b-uncensored-mtp",
+    model="ternary-bonsai-2-27b-pq2",
     messages=[{"role": "user", "content": "hello"}],
 )
 ```
 
-Raw Ollama endpoints work too: `http://127.0.0.1:8317/api/generate`.
+Any `llama-server`-compatible path under `/v1` is proxied transparently, e.g.
+`http://127.0.0.1:8317/v1/models`.
 
 ## Using a different model
 
-Set `model` in `config.toml`. Two kinds:
+There is no `model` config key. **The notebook is the single source of truth** for the
+model, the weights and the context width, because it is the thing that actually loads
+them: it downloads the GGUF, launches `llama-server`, and declares `MTP_MODEL` /
+`NUM_CTX`. Editing config to disagree with the notebook would only produce a kernel that
+advertises one model and serves another.
+
+To serve something else, point `source_notebook` at a notebook that loads it:
 
 ```toml
-# 1. Any Ollama library model. Nothing to build - the notebook just pulls it.
 [kernel]
-model = "qwen3:30b-a3b"
-# also fine: "llama3.1:70b-instruct-q4_K_M", "deepseek-r1:14b", "gpt-oss:20b"
-
-# 2. A Hugging Face GGUF, derived into a local variant (what the shipped notebook
-#    does, so speculative decoding stays available).
-[kernel]
-model        = "qwen3.8-27b-uncensored-mtp"
-source_model = "hf.co/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF:Q4_K_M"
+source_notebook = "your_notebook.ipynb"
 ```
 
-`derive_model` is inferred: a colon tag with no `hf.co/` prefix is treated as a
-library model. Set `derive_model = true` or `false` to override.
+Two requirements, both structural:
 
-Two things to know when switching:
+- **The notebook must end up serving an OpenAI-compatible API on `127.0.0.1:8080`.**
+  The tunnel and the pool's readiness probe both target that port; a server on another
+  port comes up fine and then 502s every request.
+- **It must define `MTP_MODEL`** (the name clients send) and `NUM_CTX`. Both are read
+  straight out of the notebook and used for the generated header and the model name the
+  pool advertises. Missing values fall back to the shipped defaults rather than failing,
+  so check `kaggle-rotate render` if the name looks wrong.
 
-- **Library models get no speculative decoding.** `draft_num_predict` only applies to
-  a derived variant, so it is ignored on the library path.
-- **Your source notebook's own model assignment is rewritten**, not just this tool's
-  cells. Otherwise it would keep creating and loading the old model while the
-  prewarm cell waited for the new one that never arrives.
+Benchmark, tunnel and diagnostics sections at the end of a notebook are dropped from the
+rendered kernel, so they cost nothing per session.
 
 Preview what would be pushed before spending quota:
 
@@ -124,11 +133,11 @@ Rotation is **prewarm-then-cutover**, never kill-then-restart:
 1. The active session is `prewarm_lead_minutes` (default 120) from its 12h cap, or its
    account is near the 30h weekly cap. The pool picks whichever other account has the
    most budget left and pushes the kernel.
-2. That kernel installs Ollama, pulls the weights, opens its own quick tunnel, and
-   **registers its tunnel URL with the relay** — that callback is how the pool learns
-   an address it never had to scrape. It then warms the model into VRAM.
-3. Once the pool health-checks the new endpoint *and* confirms the model is resident,
-   the proxy flips its active upstream. New requests go to the new session.
+2. That kernel builds PrismML's `llama.cpp`, downloads the PQ2_0 GGUF, starts
+   `llama-server`, opens its own quick tunnel, and **registers its tunnel URL with the
+   relay** — that callback is how the pool learns an address it never had to scrape.
+3. Once `llama-server` answers `/health` — which it only does once the model is
+   resident — the proxy flips its active upstream. New requests go to the new session.
 4. The old session keeps answering for `drain_grace_seconds` so in-flight streams
    finish, then its kernel is **deleted**. Kaggle stops billing it.
 
@@ -152,9 +161,8 @@ you are most likely to want:
 | `rotation.idle_stop_minutes` | `0` | Set `30` to release the GPU when nothing is calling |
 | `rotation.weekly_limit_hours` | `30` | Kaggle's quota "is 30 hours or sometimes higher" — set what your account actually shows |
 | `kernel.accelerator` | `NvidiaTeslaT4` | `NvidiaTeslaT4` is 2× T4; also available: `NvidiaTeslaA100`, `NvidiaL4`, `NvidiaH100` |
-| `kernel.model` | *(from notebook)* | Serve a different model; library refs like `qwen3:30b-a3b` just work |
-| `kernel.derive_model` | *(inferred)* | `false` to pull a library model instead of deriving a variant |
-| `kernel.num_ctx` | `65536` | Lower it if the model will not fit alongside the KV cache |
+| `kernel.source_notebook` | *(Bonsai notebook)* | Serve a different model; the notebook owns the model, weights and context |
+| `kernel.max_runtime_minutes` | `660` | Lower it to rotate sooner, so a slow boot has slack |
 | `relay.public_url` | *(unset)* | Use a named Cloudflare tunnel instead of a quick tunnel |
 
 Per-account weekly caps live in `~/.config/kaggle-rotate/accounts.json` (`weekly_limit_hours`).
@@ -205,14 +213,21 @@ uv run kaggle-rotate cleanup        # delete it
   and a kernel would never notice it had been abandoned. The pool now pulses the relay
   every tick, the relay reports `driver_alive`, and a kernel that stops seeing pulses
   shuts itself down after `kernel.orphan_grace_seconds`.
-- **Notebook boot time is the hard floor on lead time.** If a session fills its 12h
-  and the next one needs 25 minutes to become resident, a short `prewarm_lead_minutes`
-  guarantees a gap. 120 minutes is comfortable.
+- **Notebook boot time is the hard floor on lead time**, and it is much larger with this
+  runtime than it was under Ollama. Budget **20–40 minutes** for the first boot: a git
+  clone, a CUDA compile of `llama.cpp`, a 7.2 GB download, then the model load at
+  262,144 context. `rotation.prewarm_lead_minutes` (default 120) must comfortably exceed
+  it or a rotation will open a gap where no session is serving. Verify it on your first
+  boot and raise the lead if the log shows it taking longer.
+  `rotation.boot_timeout_seconds` (default 2400) also has to cover that build — raise it
+  if the pool gives up mid-boot.
 - **Weekly quota is estimated from wall time**, since Kaggle only reports real GPU
   seconds after a session ends. Slight over-counting is deliberate.
-- **Ollama keeps models on the Kaggle disk**, so every session re-pulls ~17 GB. Using a
-  published dataset of the weights would cut boot time substantially.
-- `cleanup` deletes the kernel this tool created (`kaggle-rotate-ollama` under each
+- **Boot is a compiler build, not a package install.** Each session clones
+  `Bonsai-demo` and builds it with CUDA, then pulls 7.2 GB. A published Kaggle dataset
+  holding the compiled runtime and the GGUF would cut this substantially — it is the
+  single biggest win available.
+- `cleanup` deletes the kernel this tool created (`kaggle-rotate-llamacpp` under each
   account). It cannot distinguish that kernel from your own runs, so point
   `kernel.kernel_slug` at something you do not use for anything else.
 

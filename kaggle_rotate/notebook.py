@@ -1,10 +1,14 @@
 """Builds the Kaggle-side server notebook from the user's source notebook.
 
-The source notebook's setup cells (Ollama install, model pull, MTP definition,
-warm-up load) are reused so the server inherits whatever the user already tuned.
+The source notebook's setup cells (PrismML llama.cpp build, GGUF download,
+llama-server launch) are reused verbatim so the server inherits whatever the user
+already tuned and proved works. The notebook is the single source of truth for the
+model, the weights and the context window: there is no config surface for any of it.
+
 Everything after the tunnel section is dropped and replaced with:
 
   * a Cloudflare quick tunnel for the model,
+  * a readiness gate on llama-server,
   * registration with the local control relay,
   * a supervisor loop that heartbeats, honours remote shutdown, and self-terminates
     before Kaggle's hard session cap.
@@ -29,15 +33,24 @@ from .naming import slugify
 
 _ASSIGN_RE = r"""^\s*{name}\s*=\s*["']?(?P<value>[^"'\n#]+)["']?\s*$"""
 
+# llama-server binds the loopback port the notebook's own `OLLAMA_URL` alias points at.
+# The PrismML launcher reads PORT=8080; TUNNEL_CELL must expose the same port.
+MODEL_BASE_URL = "http://127.0.0.1:8080"
+HOST_HEADER = "localhost:8080"
+HEALTH_PATH = "/health"
+
+# Used only if the source notebook ever stops declaring these, so a build still
+# renders and the failure names the notebook instead of raising.
+FALLBACK_MODEL = "ternary-bonsai-2-27b-pq2"
+FALLBACK_NUM_CTX = 262144
+
 
 @dataclass
-class SourceModel:
-    source_model: str = ""
-    model: str = ""
-    num_ctx: int = 65536
-    draft_num_predict: int = 2
-    # False when the model is already published in the Ollama library.
-    derive_model: bool = True
+class ServedModel:
+    """What the generated notebook serves, as declared by the source notebook."""
+
+    model: str = FALLBACK_MODEL
+    num_ctx: int = FALLBACK_NUM_CTX
 
 
 def _assignment(source: str, name: str) -> str | None:
@@ -45,51 +58,29 @@ def _assignment(source: str, name: str) -> str | None:
     return match.group("value").strip().strip("\"'") if match else None
 
 
-def load_source_config(path: Path) -> SourceModel:
-    """Pull model/ctx/draft settings out of the user's notebook."""
+def read_served_model(path: Path) -> ServedModel:
+    """Read the served model name and context width out of the source notebook.
+
+    The notebook owns these because it is what actually loads them: `MTP_MODEL` is the
+    name llama-server is started under and `NUM_CTX` is the context the PrismML
+    launcher was tuned for. The local pool needs the name too (it reports it from the
+    relay and matches it in `doctor`), so it is parsed here rather than duplicated in
+    config.
+    """
     if not path.exists():
-        return SourceModel()
+        return ServedModel()
     notebook = json.loads(path.read_text())
     blob = "\n".join("".join(cell.get("source", [])) for cell in notebook.get("cells", []))
 
-    def as_int(value: str | None, fallback: int) -> int:
-        try:
-            return int(str(value).strip())
-        except (TypeError, ValueError):
-            return fallback
-
-    num_ctx = as_int(_assignment(blob, "NUM_CTX"), 65536)
-    draft = as_int(_assignment(blob, "DRAFT_TOKENS"), 2)
-    return SourceModel(
-        source_model=_assignment(blob, "SOURCE_MODEL") or "",
-        model=_assignment(blob, "MTP_MODEL") or "",
-        num_ctx=num_ctx,
-        draft_num_predict=draft,
+    num_ctx = _assignment(blob, "NUM_CTX")
+    try:
+        parsed_ctx = int(str(num_ctx).strip())
+    except (TypeError, ValueError):
+        parsed_ctx = FALLBACK_NUM_CTX
+    return ServedModel(
+        model=_assignment(blob, "MTP_MODEL") or FALLBACK_MODEL,
+        num_ctx=parsed_ctx,
     )
-
-
-def resolve_model_config(config: Config) -> SourceModel:
-    """Work out which model to serve.
-
-    Precedence: explicit config, then whatever the source notebook declares.
-    `derive_model` is auto-detected from the model reference unless set explicitly,
-    so `model = "qwen3:30b-a3b"` works with no further ceremony.
-    """
-    source = load_source_config(config.resolved_source_notebook())
-    if config.kernel.source_model:
-        source.source_model = config.kernel.source_model
-    if config.kernel.model:
-        source.model = config.kernel.model
-    source.num_ctx = config.kernel.num_ctx or source.num_ctx
-    source.draft_num_predict = config.kernel.draft_num_predict or source.draft_num_predict
-
-    if config.kernel.derive_model is None:
-        # A colon tag (and no hf.co prefix) means an Ollama library reference, which
-        # must not go through the HF download + derive path.
-        source.derive_model = not (source.model and is_library_ref(source.model))
-    else:
-        source.derive_model = config.kernel.derive_model
-    return source
 
 
 # ------------------------------------------------------------------- transforms
@@ -98,70 +89,23 @@ def resolve_model_config(config: Config) -> SourceModel:
 # header also drops the code cell that follows it, which is how the expensive demo
 # cells get out of the boot path.
 DROP_MARKDOWN_MARKERS = (
-    "Benchmark generation speed",
-    "Load the base 27B model",
-    "Optional: expose Ollama",
-    "Install Cloudflare Tunnel",
-    "Test the Ollama API",
-    "Test through the public tunnel",
-    "OpenAI-compatible client settings",
-    "Interactive Ollama CLI",
+    "Raw llama.cpp benchmark",
+    "API benchmark",
 )
 
-# Code cells after these are hard-cut: everything from here on is exposure/UI code.
+# Code cells after these are hard-cut: everything from here on is exposure/UI code,
+# which kaggle-rotate replaces with its own tunnel and control-plane cells.
 CUTOFF_CODE_MARKERS = ("cloudflared", "PUBLIC_OLLAMA_URL")
 
-# The source notebook hardcodes the served model in an environment cell and a later
-# cell derives from it. A config override has to reach *those* cells, not just the
-# cells this tool appends, or the notebook would create and load the old model.
-ASSIGNMENT_PLACEHOLDERS = {
-    "SOURCE_MODEL": "SOURCE_MODEL",
-    "MTP_MODEL": "MODEL",
-    "NUM_CTX": "NUM_CTX",
-    "DRAFT_TOKENS": "DRAFT",
-}
-
-
-def _rewrite_assignments(source: str) -> str:
-    """Turn `SOURCE_MODEL = "hf.co/..."` into `SOURCE_MODEL = "@SOURCE_MODEL@"`.
-
-    The original quoting has to survive, otherwise a substituted string literal turns
-    into bare text and the cell stops parsing.
-    """
-    for name, placeholder in ASSIGNMENT_PLACEHOLDERS.items():
-        quoted = re.compile(rf"^(\s*{name}\s*=\s*)([\"'])(.*?)([\"'])([^\n]*)$", re.MULTILINE)
-        source = quoted.sub(rf"\g<1>\g<2>@{placeholder}@\g<4>\g<5>", source)
-        bare = re.compile(rf"^(\s*{name}\s*=\s*)(?!\s*[\"'])(\S+)(\s*#.*)?$", re.MULTILINE)
-        source = bare.sub(rf"\g<1>@{placeholder}@\g<3>", source)
-    return source
-
-
-# A code cell that derives a model from a parent via /api/create. Skipped when the
-# chosen model already exists in the Ollama library.
-DERIVE_CELL_MARKER = "/api/create"
-
-
-def is_library_ref(model: str) -> bool:
-    """True for an Ollama library reference such as `qwen3:30b-a3b`.
-
-    Hugging Face GGUF references look like `hf.co/user/repo:Q4_K_M` and are not
-    library refs, because Ollama has to be told to download them from HF.
-    """
-    if model.startswith(("hf.co/", "hf://")):
-        return False
-    return ":" in model.rsplit("/", 1)[-1]
-
-
 _SHELL_LINE = re.compile(r"^\s*!(?P<cmd>.+)$")
-_BIN_VAR = "{OLLAMA_BIN}"
 
 
 def _rewrite_shell_cell(source: str) -> str:
     """Turn `!cmd` notebook lines into subprocess calls.
 
-    `!{OLLAMA_BIN} list` is a Python syntax error inside a notebook kernel, and naive
-    interpolation would also break on any command containing quotes. Splitting the
-    shell line on the OLLAMA_BIN marker and repr()ing each piece sidesteps both.
+    A leading `!` is a Python syntax error inside a notebook kernel, and naive
+    interpolation would break on any command containing quotes, so the command is
+    repr()'d as a single literal instead.
     """
     lines = source.splitlines()
     if not any(_SHELL_LINE.match(line) for line in lines):
@@ -172,20 +116,11 @@ def _rewrite_shell_cell(source: str) -> str:
         if not match:
             rewritten.append(line)
             continue
-        command = match.group("cmd").strip()
-        exprs: list[str] = []
-        for index, part in enumerate(command.split(_BIN_VAR)):
-            if index:
-                exprs.append("OLLAMA_BIN")
-            if part:
-                exprs.append(repr(part))
-        rewritten.append(f"sh({' + '.join(exprs) or repr('')})")
+        rewritten.append(f"sh({match.group('cmd').strip()!r})")
     return "\n".join(rewritten)
 
 
-def extract_setup_cells(
-    notebook: dict[str, Any], *, skip_derive: bool = False
-) -> list[dict[str, Any]]:
+def extract_setup_cells(notebook: dict[str, Any]) -> list[dict[str, Any]]:
     """Keep the source notebook's setup cells, dropping UI/demo code we replace."""
     kept: list[dict[str, Any]] = []
     dropping_code = False
@@ -204,11 +139,8 @@ def extract_setup_cells(
             continue
         if any(marker in source for marker in CUTOFF_CODE_MARKERS):
             break
-        # Deriving a variant is meaningless for a model that is already published.
-        if skip_derive and DERIVE_CELL_MARKER in source:
-            continue
         rewritten = dict(cell)
-        source = _rewrite_assignments(_rewrite_shell_cell(source))
+        source = _rewrite_shell_cell(source)
         rewritten["source"] = source.splitlines(keepends=True)
         kept.append(rewritten)
 
@@ -229,16 +161,12 @@ class LaunchSpec:
     kernel_ref: str
     relay_url: str
     token: str
+    # The served model name, read out of the source notebook so the pool can report it
+    # before any kernel registers.
     model: str
-    source_model: str
-    num_ctx: int
-    draft_num_predict: int
     max_runtime_seconds: float
     shutdown_poll_seconds: float
     orphan_grace_seconds: float = 900.0
-    # False for a model that already exists in the Ollama library: no HF download and
-    # no derived variant, just `ollama pull`.
-    derive_model: bool = True
     status_path: str = "/kaggle/working/kaggle-rotate"
 
 
@@ -309,7 +237,7 @@ def _get(url, timeout=20):
 '''
 
 TUNNEL_CELL = """\
-_OLLAMA_URL = "http://127.0.0.1:11434"
+_MODEL_URL = "@MODEL_URL@"
 
 if not _shutil.which("cloudflared"):
     sh(
@@ -336,8 +264,8 @@ _tunnel_process = _subprocess.Popen(
         "--no-autoupdate",
         "--protocol", "http2",
         "--edge-ip-version", "4",
-        "--url", _OLLAMA_URL,
-        "--http-host-header", "localhost:11434",
+        "--url", _MODEL_URL,
+        "--http-host-header", "@HOST_HEADER@",
     ],
     stdout=_subprocess.PIPE,
     stderr=_subprocess.STDOUT,
@@ -369,97 +297,56 @@ if not PUBLIC_OLLAMA_URL:
 print("Public model endpoint:", PUBLIC_OLLAMA_URL + "/v1", flush=True)
 """
 
-LIBRARY_PULL_CELL = """\
-_pull_bin = _shutil.which("ollama")
-if not _pull_bin:
-    _subprocess.run(
-        "curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True
-    )
-    _pull_bin = _shutil.which("ollama")
-if not _pull_bin:
-    raise RuntimeError("ollama is not installed and could not be installed")
-
-_pull_env = globals().get("OLLAMA_ENV", _os.environ)
-print(f"pulling {_os.environ.get('MODEL_NAME', '@MODEL@')} from the Ollama library", flush=True)
-_subprocess.run([_pull_bin, "pull", "@MODEL@"], env=_pull_env, check=True)
-"""
-
-PREWARM_CELL = """\
+READY_CELL = """\
 MODEL_NAME = "@MODEL@"
-REQUESTED_NUM_CTX = @NUM_CTX@
+SERVER_LOG = "/tmp/bonsai-llama-server.log"
 
 def _gpu_report():
     output = _subprocess.run(
-        "nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader",
+        "nvidia-smi --query-gpu=index,name,memory.total,memory.used "
+        "--format=csv,noheader",
         shell=True, capture_output=True, text=True, check=False,
     ).stdout.strip()
     gpus = [line for line in output.splitlines() if line.strip()]
     for line in gpus:
         print("  GPU:", line, flush=True)
-    if len(gpus) < 2:
-        print(
-            f"  WARNING: expected 2 GPUs for this model, found {len(gpus)}. A 27B Q4 "
-            "needs ~17GB of weights plus KV cache, so a single T4 will not fit.",
-            flush=True,
-        )
+    if not gpus:
+        print("  WARNING: nvidia-smi reported no GPUs", flush=True)
     return gpus
 
-def _ollama_json(path, payload=None, timeout=30):
-    url = f"{_OLLAMA_URL}{path}"
-    if payload is None:
-        request = _urllib_request.Request(url)
-    else:
-        request = _urllib_request.Request(
-            url,
-            data=_json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-    with _urllib_request.urlopen(request, timeout=timeout) as response:
-        return _json.loads(response.read().decode("utf-8"))
-
-def _model_loaded(name):
-    try:
-        running = _ollama_json("/api/ps")
-    except Exception:
-        return False
-    return any(entry.get("name", "").startswith(name) for entry in running.get("models", []))
-
+# llama-server was launched by the source notebook and only serves /health once the
+# model is resident, so this is the readiness gate the pool has been waiting on. It
+# does NOT reload the model: the notebook already paid for the load, and a second load
+# would double VRAM.
 _gpus = _gpu_report()
 
-# Try the configured context, then shrink. Ollama reports an out-of-memory load as a
-# bare HTTP 500, which used to kill the session with no explanation while the pool sat
-# waiting for a registration that could never arrive.
-for _num_ctx in (REQUESTED_NUM_CTX, 32768, 16384, 8192):
-    if _num_ctx < REQUESTED_NUM_CTX:
-        print(f"Retrying with num_ctx={_num_ctx}", flush=True)
+_deadline = _uptime() + 120
+while _uptime() < _deadline:
     try:
-        _ollama_json(
-            "/api/generate",
-            {
-                "model": MODEL_NAME,
-                "prompt": "ready",
-                "stream": False,
-                "keep_alive": -1,
-                "options": {
-                    "draft_num_predict": @DRAFT@,
-                    "num_ctx": _num_ctx,
-                },
-            },
-            timeout=1800,
-        )
-    except Exception as exc:
-        print(f"load failed at num_ctx={_num_ctx}: {exc}", flush=True)
-        continue
-    if _model_loaded(MODEL_NAME):
-        print(f"Model resident: {MODEL_NAME} (num_ctx={_num_ctx})", flush=True)
-        break
+        with _urllib_request.urlopen(f"{_MODEL_URL}@HEALTH_PATH@", timeout=5) as _r:
+            if _r.status == 200:
+                break
+    except Exception:
+        pass
+    _time.sleep(2)
 else:
-    _subprocess.run("tail -n 40 /tmp/ollama-server.log || true", shell=True, check=False)
+    _subprocess.run(f"tail -n 60 {SERVER_LOG} || true", shell=True, check=False)
     raise RuntimeError(
-        f"could not load {MODEL_NAME} into VRAM on {len(_gpus)} GPU(s)"
+        f"llama-server never became healthy on {_MODEL_URL} "
+        f"with {len(_gpus)} GPU(s); see {SERVER_LOG}"
     )
+
+try:
+    with _urllib_request.urlopen(f"{_MODEL_URL}/v1/models", timeout=15) as _r:
+        _served = [_json.loads(_r.read().decode("utf-8"))]
+    _ids = [e.get("id") for e in (_served[0].get("data") or [])]
+    print("  llama-server models:", _ids or "(none reported)", flush=True)
+except Exception as _exc:
+    print(f"  could not list /v1/models: {_exc}", flush=True)
+
+print(f"Model resident: {MODEL_NAME} on {len(_gpus)} GPU(s)", flush=True)
 """
+
 
 REGISTER_CELL = """\
 RELAY_URL = "@RELAY_URL@"
@@ -526,9 +413,9 @@ _driver_lost_at = None
 _last_heartbeat = 0.0
 _deadline = SESSION_STARTED_AT + MAX_RUNTIME_S
 
-def _ollama_alive():
+def _model_alive():
     try:
-        _urllib_request.urlopen(f"{_OLLAMA_URL}/api/tags", timeout=5).close()
+        _urllib_request.urlopen(f"{_MODEL_URL}@HEALTH_PATH@", timeout=5).close()
         return True
     except Exception:
         return False
@@ -548,7 +435,7 @@ while _stop_reason is None:
                 "account": "@ACCOUNT@",
                 "url": PUBLIC_OLLAMA_URL,
                 "model": MODEL_NAME,
-                "ollama_alive": _ollama_alive(),
+                "model_alive": _model_alive(),
                 "elapsed_s": _time.time() - SESSION_STARTED_AT,
                 "started_at": SESSION_STARTED_AT,
             },
@@ -556,7 +443,7 @@ while _stop_reason is None:
         )
         _last_heartbeat = _uptime()
         _last_relay_ok = _last_heartbeat
-        _write_status({"phase": "serving", "ollama_alive": _ollama_alive()})
+        _write_status({"phase": "serving", "model_alive": _model_alive()})
         action = command.get("action", "keepalive")
         if action == "shutdown":
             _stop_reason = command.get("reason", "shutdown requested by pool")
@@ -599,7 +486,7 @@ _write_status({"phase": "stopping", "stop_reason": _stop_reason})
 TEARDOWN_CELL = """\
 for _name, _process in (
     ("cloudflared", _tunnel_process),
-    ("ollama", globals().get("ollama_server_process")),
+    ("llama-server", globals().get("llama_server_process")),
 ):
     if _process is None:
         continue
@@ -651,64 +538,48 @@ def _replace(template: str, **values: Any) -> str:
 
 
 def build_notebook(config: Config, spec: LaunchSpec) -> dict[str, Any]:
-    model = resolve_model_config(config)
-    if spec.model:
-        model.model = spec.model
-    if spec.source_model:
-        model.source_model = spec.source_model
-    model.num_ctx = spec.num_ctx or model.num_ctx
-    model.draft_num_predict = spec.draft_num_predict or model.draft_num_predict
-
-    derive = model.derive_model
-
     source_path = config.resolved_source_notebook()
+    served = read_served_model(source_path)
     setup_cells: list[dict[str, Any]] = []
     if source_path.exists():
-        setup_cells = extract_setup_cells(
-            json.loads(source_path.read_text()), skip_derive=not derive
-        )
+        setup_cells = extract_setup_cells(json.loads(source_path.read_text()))
 
     values = dict(
         TOKEN=spec.token,
         ACCOUNT=spec.account,
         KERNEL_REF=spec.kernel_ref,
         RELAY_URL=spec.relay_url,
-        MODEL=model.model,
-        NUM_CTX=model.num_ctx,
-        DRAFT=model.draft_num_predict,
+        MODEL=served.model,
+        MODEL_URL=MODEL_BASE_URL,
+        HOST_HEADER=HOST_HEADER,
+        HEALTH_PATH=HEALTH_PATH,
         STATUS_PATH=spec.status_path,
         MAX_RUNTIME=int(spec.max_runtime_seconds),
         POLL_S=int(spec.shutdown_poll_seconds),
         ORPHAN_GRACE=int(spec.orphan_grace_seconds),
     )
-    # The placeholders substituted into the source notebook's own cells.
-    values["SOURCE_MODEL"] = model.source_model
 
     header = (
         f"# Managed by kaggle-rotate (account `{spec.account}`)\n\n"
         f"Generated from `{source_path.name}`. Do not edit this kernel from the Kaggle UI: "
         "the local orchestrator re-renders it on every launch.\n\n"
         f"- relay: `{spec.relay_url}`\n"
-        f"- model: `{model.model}` (from `{model.source_model}`)\n"
-        f"- context: `{model.num_ctx}`\n"
+        f"- model: `{served.model}`\n"
+        f"- context: `{served.num_ctx}` (from the source notebook)\n"
+        f"- runtime: PrismML `llama-server` on `{MODEL_BASE_URL}`\n"
         f"- self-terminate after: `{spec.max_runtime_seconds / 3600:.2f}h`\n"
     )
 
-    header += f"- model source: {'derived from an HF GGUF' if derive else 'Ollama library'}\n"
-
     cells: list[dict[str, Any]] = [_markdown(header), _code(_replace(PREAMBLE, **values))]
-    # The source notebook's cells carry their own copies of these placeholders.
     cells += [
         {**cell, "source": _fill("".join(cell["source"]), values).splitlines(keepends=True)}
         for cell in setup_cells
     ]
-    if not derive:
-        cells.append(_code(_replace(LIBRARY_PULL_CELL, **values)))
     cells += [
         _markdown("## Expose the model (Cloudflare quick tunnel)"),
         _code(_replace(TUNNEL_CELL, **values)),
-        _markdown("## Make sure the model is resident before advertising readiness"),
-        _code(_replace(PREWARM_CELL, **values)),
+        _markdown("## Confirm llama-server is healthy before advertising readiness"),
+        _code(_replace(READY_CELL, **values)),
         _markdown("## Register with the local control relay"),
         _code(_replace(REGISTER_CELL, **values)),
         _markdown("## Supervise until the pool retires this session"),
@@ -763,6 +634,9 @@ def kernel_metadata(config: Config, spec: LaunchSpec) -> dict[str, Any]:
 def write_kernel(config: Config, spec: LaunchSpec, directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     notebook = build_notebook(config, spec)
+    # Record what was actually rendered, not what the caller believed: if the notebook's
+    # declared model ever drifts from the pool's view, the sidecar shows the truth.
+    rendered_model = read_served_model(config.resolved_source_notebook()).model
     (directory / "server.ipynb").write_text(json.dumps(notebook, indent=1) + "\n")
     (directory / "kernel-metadata.json").write_text(
         json.dumps(kernel_metadata(config, spec), indent=2) + "\n"
@@ -776,10 +650,7 @@ def write_kernel(config: Config, spec: LaunchSpec, directory: Path) -> Path:
                 "kernel_ref": spec.kernel_ref,
                 "relay_url": spec.relay_url,
                 "token": spec.token,
-                "model": spec.model,
-                "source_model": spec.source_model,
-                "num_ctx": spec.num_ctx,
-                "draft_num_predict": spec.draft_num_predict,
+                "model": rendered_model,
                 "max_runtime_seconds": spec.max_runtime_seconds,
                 "status_dir": spec.status_path,
             },

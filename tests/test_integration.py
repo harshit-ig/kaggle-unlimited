@@ -58,12 +58,18 @@ def stub_cli(tmp_path: Path) -> str:
     return str(path)
 
 
-def _ollama_app(model: str, served: list[str], delay: float = 0.0):
-    async def ps(_):
-        return JSONResponse({"models": [{"name": model}]})
+def _llama_server_app(model: str, served: list[str], delay: float = 0.0):
+    """The OpenAI-compatible surface llama-server exposes.
 
-    async def tags(_):
-        return JSONResponse({"models": [{"name": model}]})
+    `/health` is the readiness gate: llama-server only starts answering it once the
+    model is resident, so a 200 is the whole residency signal the pool needs.
+    """
+
+    async def health(_):
+        return JSONResponse({"status": "ok"})
+
+    async def models(_):
+        return JSONResponse({"object": "list", "data": [{"id": model, "object": "model"}]})
 
     async def chat(_):
         served.append(model)
@@ -77,8 +83,8 @@ def _ollama_app(model: str, served: list[str], delay: float = 0.0):
 
     return Starlette(
         routes=[
-            Route("/api/ps", ps),
-            Route("/api/tags", tags),
+            Route("/health", health),
+            Route("/v1/models", models),
             Route("/v1/chat/completions", chat, methods=["POST"]),
         ]
     )
@@ -101,7 +107,7 @@ class FakeKernel:
 
     async def start(self) -> str:
         url = await self.stack.enter_async_context(
-            serve(_ollama_app(self.spec["model"], self.served), free_port())
+            serve(_llama_server_app(self.spec["model"], self.served), free_port())
         )
         await self.pool.relay_state.register(
             self.spec["token"],
@@ -190,7 +196,9 @@ async def test_pool_rotates_across_accounts_and_moves_traffic(tmp_path: Path, st
 
                 first_spec = kernels[first].spec
                 assert first_spec["relay_url"] == config.relay.public_url
-                assert first_spec["model"] == "qwen3.8-27b-uncensored-mtp"
+                # The sidecar reports the model the notebook actually declares, so the
+                # pool never advertises a name the kernel will not answer to.
+                assert first_spec["model"] == "ternary-bonsai-2-27b-pq2"
                 assert first_spec["token"]
 
                 # Real HTTP through the proxy reaches the standing session.
@@ -342,7 +350,9 @@ async def test_a_slow_kaggle_probe_does_not_freeze_the_api(tmp_path: Path, slow_
         await asyncio.sleep(0.5)
 
         async with AsyncExitStack() as stack:
-            url = await stack.enter_async_context(serve(_ollama_app("m", served), free_port()))
+            url = await stack.enter_async_context(
+                serve(_llama_server_app("m", served), free_port())
+            )
             assert pool.router.active is not None
             pool.router.active.url = url
             pool.state.update("acct0", url=url)

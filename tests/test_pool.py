@@ -449,9 +449,6 @@ async def test_boot_fails_fast_when_the_kernel_dies(tmp_path: Path):
         relay_url="http://relay",
         token="tok",
         model="m",
-        source_model="s",
-        num_ctx=65536,
-        draft_num_predict=2,
         max_runtime_seconds=600,
         shutdown_poll_seconds=1,
     )

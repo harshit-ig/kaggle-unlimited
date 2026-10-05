@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .accounts import Account, AccountStore, KaggleCLI, KaggleError, kernel_is_gone
 from .config import Config, load_config
-from .notebook import LaunchSpec, build_notebook, resolve_model_config
+from .notebook import MODEL_BASE_URL, LaunchSpec, build_notebook, read_served_model
 from .pool import Pool
 from .proxy import UpstreamRouter
 from .quota import Ledger, utcnow, week_start
@@ -55,12 +55,11 @@ def cmd_init(args: argparse.Namespace, config: Config) -> int:
 
     source = config.resolved_source_notebook()
     if source.exists():
-        model = resolve_model_config(config)
+        served = read_served_model(source)
         print(f"source notebook: {source.name}")
-        print(f"  model:        {model.model}")
-        print(f"  base model:   {model.source_model}")
-        print(f"  num_ctx:      {model.num_ctx}")
-        print(f"  draft tokens: {model.draft_num_predict}")
+        print(f"  model:        {served.model}")
+        print(f"  num_ctx:      {served.num_ctx}")
+        print(f"  runtime:      llama-server on {MODEL_BASE_URL}")
     else:
         print(f"source notebook not found: {source}")
 
@@ -331,16 +330,13 @@ def cmd_cleanup(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_render(args: argparse.Namespace, config: Config) -> int:
-    model = resolve_model_config(config)
+    served = read_served_model(config.resolved_source_notebook())
     spec = LaunchSpec(
         account=args.account or "example",
         kernel_ref=f"{args.account or 'example'}/{config.kernel.kernel_slug}",
         relay_url=args.relay_url or "https://REPLACE-ME.trycloudflare.com",
         token="render-only-token",
-        model=model.model,
-        source_model=model.source_model,
-        num_ctx=model.num_ctx,
-        draft_num_predict=model.draft_num_predict,
+        model=served.model,
         max_runtime_seconds=config.kernel.max_runtime_minutes * 60,
         shutdown_poll_seconds=config.kernel.shutdown_poll_seconds,
     )
@@ -392,9 +388,9 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     source = config.resolved_source_notebook()
     check(f"source notebook {source.name}", source.exists(), str(source))
     if source.exists():
-        model = resolve_model_config(config)
-        check("model resolved", bool(model.model), model.model or "none")
-        check("base model resolved", bool(model.source_model), model.source_model or "none")
+        served = read_served_model(source)
+        check("served model declared", bool(served.model), served.model)
+        check("context declared", served.num_ctx > 0, str(served.num_ctx))
 
     store = AccountStore(config)
     accounts = store.load()
@@ -453,7 +449,7 @@ async def _run_pool(config: Config) -> int:
         await pool.start()
         (state_dir / "relay.json").write_text(json.dumps({"url": pool.relay_public_url}) + "\n")
         print(f"\nclient base URL: http://{config.proxy.host}:{config.proxy.port}/v1")
-        print(f"model name:      {resolve_model_config(config).model or '(unset)'}")
+        print(f"model name:      {read_served_model(config.resolved_source_notebook()).model}")
         print("press Ctrl-C to stop\n")
         waiter = asyncio.create_task(stop.wait())
         runner = asyncio.create_task(pool.run_forever())

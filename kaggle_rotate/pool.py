@@ -27,7 +27,7 @@ from starlette.applications import Starlette
 
 from .accounts import Account, KaggleCLI
 from .config import Config
-from .notebook import LaunchSpec, resolve_model_config, write_kernel
+from .notebook import HEALTH_PATH, LaunchSpec, read_served_model, write_kernel
 from .proxy import ProxyApp, Upstream, UpstreamRouter
 from .quota import Budget, Ledger, hours
 from .relay import RelayState
@@ -220,17 +220,17 @@ class Pool:
     # ------------------------------------------------------------- probing
 
     async def _probe(self, url: str, model: str = "") -> bool:
+        """True when the endpoint is serving a resident model.
+
+        llama-server only answers /health once the model is loaded, so a 200 already
+        means "resident". The model name is deliberately not matched: llama-server
+        reports the GGUF path as its id, not the MTP_MODEL alias the notebook declares.
+        """
         if not url:
             return False
         try:
-            response = await self._http.get(f"{url}/api/ps", timeout=20.0)
-            if response.status_code != 200:
-                return False
-            payload = response.json()
-            if not model:
-                return True  # server is reachable; residency is not what was asked
-            models = [entry.get("name", "") for entry in payload.get("models", [])]
-            return any(name.startswith(model) for name in models)
+            response = await self._http.get(f"{url}{HEALTH_PATH}", timeout=20.0)
+            return response.status_code == 200
         except httpx.HTTPError:
             return False
 
@@ -504,17 +504,14 @@ class Pool:
 
     async def _launch(self, account: Account) -> LaunchSpec:
         kernel = self.config.kernel
-        model = resolve_model_config(self.config)
+        served = read_served_model(self.config.resolved_source_notebook())
         token = secrets.token_urlsafe(32)
         spec = LaunchSpec(
             account=account.slug,
             kernel_ref=account.ref,
             relay_url=self.relay_public_url,
             token=token,
-            model=model.model,
-            source_model=model.source_model,
-            num_ctx=model.num_ctx,
-            draft_num_predict=model.draft_num_predict,
+            model=served.model,
             max_runtime_seconds=kernel.max_runtime_minutes * 60.0,
             shutdown_poll_seconds=kernel.shutdown_poll_seconds,
             orphan_grace_seconds=kernel.orphan_grace_seconds,
@@ -530,7 +527,7 @@ class Pool:
             token=token,
             started_at=time.time(),
             url="",
-            model=model.model,
+            model=served.model,
             detail="pushing kernel",
         )
         log.info("pushing kernel for %s (%s)", account.slug, account.ref)

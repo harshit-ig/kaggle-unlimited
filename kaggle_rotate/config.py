@@ -70,23 +70,13 @@ class RotationConfig:
 @dataclass
 class KernelConfig:
     accelerator: str = "NvidiaTeslaT4"
-    kernel_slug: str = "kaggle-rotate-ollama"
+    kernel_slug: str = "kaggle-rotate-llamacpp"
     # Must slugify to kernel_slug; Kaggle derives the kernel slug from the title.
     title: str = ""
     is_private: bool = True
-    # Notebook this derives its model/ctx settings from.
-    source_notebook: str = "qwen38_27b_kaggle_ollama_mtp_clean_64k.ipynb"
-    # Name clients send, e.g. "qwen3:30b-a3b" or "my-model:8b".
-    model: str = ""
-    # Hugging Face GGUF to download and derive from, e.g. "hf.co/user/repo:Q4_K_M".
-    # Only used when derive_model is true.
-    source_model: str = ""
-    # True: download source_model and derive `model` from it (MTP speculative decoding).
-    # False: `model` already exists in the Ollama library, so just pull it.
-    # None (default): infer from the model reference.
-    derive_model: bool | None = None
-    num_ctx: int = 65536
-    draft_num_predict: int = 2
+    # Notebook the server is built from. It is also the source of truth for the model,
+    # the weights and the context width: there is no config surface for any of those.
+    source_notebook: str = "bonsai2_27b_pq2_0_kaggle_llamacpp.ipynb"
     # Notebook self-terminates before Kaggle's hard cap so quota is never wasted.
     max_runtime_minutes: float = 660.0
     shutdown_poll_seconds: float = 20.0

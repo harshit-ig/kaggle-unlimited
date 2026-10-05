@@ -17,14 +17,14 @@ from kaggle_rotate.proxy import ProxyApp, Upstream, UpstreamRouter
 from tests.helpers import serve, settle
 
 
-def _fake_ollama(name: str, chunk_delay: float = 0.02):
-    """Minimal Ollama surface: /api/ps for residency, /v1/chat/completions streaming."""
+def _fake_llama_server(name: str, chunk_delay: float = 0.02):
+    """The surface llama-server exposes: /health, /v1/models, /v1/chat/completions."""
 
-    async def ps(_):
-        return JSONResponse({"models": [{"name": name, "size_vram": 1}]})
+    async def health(_):
+        return JSONResponse({"status": "ok"})
 
-    async def tags(_):
-        return JSONResponse({"models": [{"name": name}]})
+    async def models(_):
+        return JSONResponse({"object": "list", "data": [{"id": name, "object": "model"}]})
 
     async def chat(request):
         payload = await request.json()
@@ -49,8 +49,8 @@ def _fake_ollama(name: str, chunk_delay: float = 0.02):
 
     return Starlette(
         routes=[
-            Route("/api/ps", ps),
-            Route("/api/tags", tags),
+            Route("/health", health),
+            Route("/v1/models", models),
             Route("/v1/chat/completions", chat, methods=["POST"]),
         ]
     )
@@ -68,7 +68,10 @@ async def _collect(client: httpx.AsyncClient, url: str) -> list[dict]:
 
 
 async def test_inflight_stream_finishes_on_retired_upstream():
-    async with serve(_fake_ollama("A"), 0) as url_a, serve(_fake_ollama("B"), 0) as url_b:
+    async with (
+        serve(_fake_llama_server("A"), 0) as url_a,
+        serve(_fake_llama_server("B"), 0) as url_b,
+    ):
         router = UpstreamRouter(drain_grace=5.0)
         router.set_active(Upstream(name="a", url=url_a, healthy=True))
         proxy = ProxyApp(router)
@@ -109,7 +112,7 @@ async def test_proxy_503s_with_a_useful_body_when_nothing_is_active():
 
 
 async def test_dead_active_falls_back_to_healthy_standby():
-    async with serve(_fake_ollama("B"), 0) as url_b:
+    async with serve(_fake_llama_server("B"), 0) as url_b:
         router = UpstreamRouter(drain_grace=5.0)
         # port 1 is not listening: simulates a kernel whose tunnel just died
         router.set_active(Upstream(name="dead", url="http://127.0.0.1:1", healthy=True))
@@ -126,7 +129,7 @@ async def test_dead_active_falls_back_to_healthy_standby():
 
 
 async def test_non_streaming_request_relays_json_unchanged():
-    async with serve(_fake_ollama("A"), 0) as url_a:
+    async with serve(_fake_llama_server("A"), 0) as url_a:
         router = UpstreamRouter()
         router.set_active(Upstream(name="a", url=url_a, healthy=True))
         proxy = ProxyApp(router)
@@ -166,7 +169,7 @@ async def test_request_waits_for_a_session_instead_of_failing_immediately():
     transport = httpx.ASGITransport(app=proxy.app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as client:
-            async with serve(_fake_ollama("B"), 0) as url_b:
+            async with serve(_fake_llama_server("B"), 0) as url_b:
                 task = asyncio.create_task(
                     client.post("/v1/chat/completions", json={"model": "m", "stream": True})
                 )

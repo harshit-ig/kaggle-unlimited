@@ -334,6 +334,24 @@ def test_metadata_id_and_title_slug_always_agree():
     assert metadata["id"].split("/")[-1] == slugify(metadata["title"])
 
 
+def test_heartbeat_field_matches_what_the_relay_reads():
+    """Regression: the notebook was renamed to send `model_alive` while the relay still
+    read `ollama_alive`, so every session was reported healthy no matter what the kernel
+    said about its own server. The two sides are separate strings, so assert they match."""
+    from kaggle_rotate import relay as relay_module
+
+    supervisor = _blob(build_notebook(_config(), _spec())).split("def _model_alive")[-1]
+    sent = set(re.findall(r'"(\w+_alive)":', supervisor))
+    assert sent == {"model_alive"}, f"notebook sends {sent}"
+
+    source = Path(relay_module.__file__).read_text()
+    assert "session.model_alive = bool(" in source, "relay must read the field it receives"
+    assert 'payload.get("model_alive"' in source, "relay must accept model_alive"
+    # The legacy key stays readable so a kernel rendered before the switch is not
+    # reported healthy just because we renamed the field.
+    assert 'payload.get("ollama_alive"' in source, "legacy key should remain a fallback"
+
+
 def test_account_no_longer_carries_its_own_kernel_slug():
     """Two sources of truth is the bug; assert the duplicate is gone, not just unused."""
     from kaggle_rotate.accounts import Account

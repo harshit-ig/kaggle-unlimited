@@ -35,7 +35,7 @@ class RemoteSession:
     registered_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     last_error: str = ""
-    ollama_alive: bool = True
+    model_alive: bool = True
     command: str = "keepalive"
     command_reason: str = ""
     phase: str = "registered"
@@ -51,7 +51,7 @@ class RemoteSession:
             "registered_at": self.registered_at,
             "last_seen": self.last_seen,
             "silent_seconds": round(time.time() - self.last_seen, 1),
-            "ollama_alive": self.ollama_alive,
+            "model_alive": self.model_alive,
             "command": self.command,
             "command_reason": self.command_reason,
             "phase": self.phase,
@@ -110,7 +110,11 @@ class RelayState:
             session.last_seen = time.time()
             if payload.get("url"):
                 session.url = str(payload["url"]).rstrip("/")
-            session.ollama_alive = bool(payload.get("ollama_alive", True))
+            # The notebook sends `model_alive`; accept the old key too so a kernel
+            # rendered before the llama-server switch is not silently reported healthy.
+            session.model_alive = bool(
+                payload.get("model_alive", payload.get("ollama_alive", True))
+            )
             session.phase = "serving"
             return session
 

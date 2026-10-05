@@ -593,15 +593,17 @@ class Pool:
                             "notebook on kaggle.com to read the cell output"
                         )
 
-            # Booting takes 10-25 minutes (weights + VRAM). Without this the terminal
-            # looks hung, and stage names point at the notebook on kaggle.com.
+            # Booting is a CUDA build plus a weights download, so it takes tens of
+            # minutes. Without this the terminal looks hung, and stage names point at
+            # the notebook on kaggle.com where the real progress is visible.
             if time.monotonic() - last_progress >= 60:
                 last_progress = time.monotonic()
                 minutes = (time.monotonic() - started) / 60
                 stage = (
-                    "tunnel is up, waiting for the model to land in VRAM"
+                    "tunnel is up, waiting for llama-server to report healthy"
                     if remote is not None
-                    else "waiting for Kaggle to schedule the kernel, then pulling ~17GB"
+                    else "waiting for Kaggle to schedule the kernel, then building "
+                    "llama.cpp and pulling the GGUF"
                 )
                 log.info("%s still booting (%.0f min): %s", account_slug, minutes, stage)
             await asyncio.sleep(15)

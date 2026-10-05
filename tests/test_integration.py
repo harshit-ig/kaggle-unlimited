@@ -124,7 +124,7 @@ class FakeKernel:
     async def _beat(self, url: str) -> None:
         while True:
             session = await self.pool.relay_state.heartbeat(
-                self.spec["token"], {"url": url, "ollama_alive": True}
+                self.spec["token"], {"url": url, "model_alive": True}
             )
             if session is not None and session.command == "shutdown":
                 self.retired = True

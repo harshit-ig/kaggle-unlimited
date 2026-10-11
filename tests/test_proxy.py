@@ -543,3 +543,32 @@ async def test_private_network_opt_in_is_present_for_chrome_extensions():
         assert response.headers["access-control-allow-private-network"] == "true"
     finally:
         await proxy.aclose()
+
+
+async def test_a_parked_request_stops_waiting_when_shutdown_begins():
+    """A request arriving while nothing is serving sat out the whole connect_grace
+    (90s by default). That held its uvicorn connection open, so the server task could
+    not finish, shutdown timed out, and every Ctrl-C printed a CancelledError dump."""
+    from kaggle_rotate.proxy import ProxyApp
+
+    router = UpstreamRouter(drain_grace=0.0)
+    proxy = ProxyApp(router, connect_grace=90.0)
+    started = time.monotonic()
+
+    task = asyncio.create_task(proxy._await_upstream())
+    await asyncio.sleep(0.05)
+    proxy.begin_shutdown()
+    assert await asyncio.wait_for(task, timeout=2.0) is None
+
+    assert time.monotonic() - started < 5.0, "must give up at once, not after the grace"
+
+
+async def test_without_shutdown_the_grace_is_still_honoured():
+    """The grace exists so a request during a cutover is not failed; shutdown must
+    shorten it without removing it."""
+    from kaggle_rotate.proxy import ProxyApp
+
+    proxy = ProxyApp(UpstreamRouter(drain_grace=0.0), connect_grace=0.3)
+    started = time.monotonic()
+    assert await proxy._await_upstream() is None
+    assert time.monotonic() - started >= 0.25

@@ -22,6 +22,10 @@ class SlotState:
     url: str = ""
     model: str = ""
     started_at: float = 0.0
+    # When the current launch was pushed. Distinct from `started_at` only in intent:
+    # this is the clock the boot timeout is measured against, and it is set before
+    # `kaggle kernels push` returns, so the budget covers the push itself.
+    boot_started_at: float = 0.0
     last_transition: float = field(default_factory=time.time)
     detail: str = ""
     last_attempt: float = 0.0

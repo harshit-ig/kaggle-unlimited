@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .accounts import Account, AccountStore, KaggleCLI, KaggleError, kernel_is_gone
 from .config import Config, load_config
+from .naming import slugify
 from .notebook import MODEL_BASE_URL, LaunchSpec, build_notebook, read_served_model
 from .pool import Pool
 from .proxy import UpstreamRouter
@@ -116,8 +117,6 @@ def cmd_init(args: argparse.Namespace, config: Config) -> int:
 
 
 def _store_json(store: AccountStore, accounts: dict, slug: str, path: str) -> Account | None:
-    from .accounts import slugify
-
     src = Path(path).expanduser()
     try:
         data = json.loads(src.read_text())
@@ -137,8 +136,6 @@ def _store_json(store: AccountStore, accounts: dict, slug: str, path: str) -> Ac
 
 
 def _store_token(store: AccountStore, accounts: dict, slug: str, token: str) -> Account | None:
-    from .accounts import slugify
-
     final = slugify(slug)
     directory = store.account_dir(final)
     directory.mkdir(parents=True, exist_ok=True)
@@ -159,7 +156,10 @@ def cmd_add_account(args: argparse.Namespace, config: Config) -> int:
     store = AccountStore(config)
     cli = KaggleCLI(config, store)
     accounts = store.load()
-    if args.kind == "token":
+    # Keyed on what the caller actually supplied. `--kind` only ever holds "kaggle_json"
+    # or "access_token", so testing `kind == "token"` could never be true and
+    # `add-account <slug> --token ...` always died on "--credential is required".
+    if args.kind == "access_token" or args.token:
         if not args.token:
             print("--token is required", file=sys.stderr)
             return 2
@@ -326,30 +326,39 @@ def cmd_cleanup(args: argparse.Namespace, config: Config) -> int:
             continue
         print(f"  .. {label}: deleting")
         try:
-            deleted = cli.delete(account)
+            refusal = cli.delete(account)
         except KaggleError as exc:
             print(f"  ! {label}: {exc}", file=sys.stderr)
             failed.append(label)
             continue
-        if deleted:
+        if refusal is None:
             print(f"  ok {label}: deleted")
+            continue
+        if kernel_is_gone(refusal):
+            print(f"  ok {label}: already gone ({refusal})")
+            continue
+        # The delete did not happen, and nothing in its reply settles whether the kernel
+        # is still running. Confirm with a listing: `kernels status` asks about the
+        # kernel itself and answers 403 for the very permission in question, so it can
+        # never break the tie -- it is what made a refused delete look like a success.
+        try:
+            still_listed = cli.lists_kernel(account)
+        except KaggleError as exc:
+            print(
+                f"  ? {label}: delete refused ({refusal}); could not confirm, status: {exc}",
+                file=sys.stderr,
+            )
+            failed.append(label)
+            continue
+        if still_listed:
+            print(
+                f"  ! {label}: delete refused ({refusal}); kernel is still listed and may be"
+                " billing GPU time. Check kaggle.com, then retry.",
+                file=sys.stderr,
+            )
+            failed.append(label)
         else:
-            # Kaggle answers 403 for a kernel that is already gone, so check before
-            # telling the user their GPU is still being billed.
-            try:
-                after = cli.status(account)
-            except KaggleError as exc:
-                if kernel_is_gone(exc):
-                    print(f"  ok {label}: already gone")
-                else:
-                    print(f"  ? {label}: delete failed, status unavailable: {exc}", file=sys.stderr)
-                    failed.append(label)
-                continue
-            if not after.known or after.alive:
-                print(f"  ! {label}: delete failed, kernel still {after.state}", file=sys.stderr)
-                failed.append(label)
-            else:
-                print(f"  ok {label}: already gone (status {after.state})")
+            print(f"  ok {label}: already gone (absent from listing after {refusal})")
 
     if failed:
         print(f"\nfailed: {'; '.join(failed)}", file=sys.stderr)

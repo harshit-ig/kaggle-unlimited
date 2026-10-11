@@ -12,6 +12,7 @@ quick tunnel in front of this app is not an open registration endpoint.
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+log = logging.getLogger("kaggle_rotate.relay")
 
 
 @dataclass
@@ -65,6 +68,7 @@ class RelayState:
     def __init__(self, driver_grace_seconds: float = 120.0) -> None:
         self._sessions: dict[str, RemoteSession] = {}
         self._lock = asyncio.Lock()
+        self._unknown_heartbeats: set[str] = set()
         # Separate from any kernel token: only the pool may assert it is driving.
         self.driver_token = secrets.token_urlsafe(32)
         # The relay can outlive the pool (an orphaned cloudflared child answers for a
@@ -86,6 +90,7 @@ class RelayState:
 
     async def register(self, token: str, payload: dict[str, Any]) -> RemoteSession:
         async with self._lock:
+            self._unknown_heartbeats.discard(token)
             session = RemoteSession(
                 token=token,
                 account=str(payload.get("account", "")),
@@ -125,6 +130,7 @@ class RelayState:
                 session.command_reason = str(payload.get("stop_reason", ""))
                 session.phase = "stopped"
                 session.last_seen = time.time()
+        self._prune_locked()
 
     async def get(self, token: str) -> RemoteSession | None:
         return self._sessions.get(token)
@@ -138,8 +144,36 @@ class RelayState:
             session.command_reason = reason
             return session
 
+    def note_unknown_heartbeat(self, token: str) -> bool:
+        """True the first time `token` heartbeats without a session. Repeat calls are
+        silent, so a kernel polling every 20s cannot flood the log."""
+        if token in self._unknown_heartbeats:
+            return False
+        self._unknown_heartbeats.add(token)
+        return True
+
     def sessions(self) -> list[RemoteSession]:
+        self._prune_locked()
         return sorted(self._sessions.values(), key=lambda s: s.registered_at)
+
+    def _prune_locked(self) -> None:
+        """Forget stopped sessions once they are safely superseded.
+
+        Nothing ever removed them, so a long-running pool accumulated one entry per
+        launch generation for the life of the process. Anything looking sessions up by
+        account then had to choose between several generations for the same account,
+        and the frozen timestamp of a long-dead one looked exactly like silence from
+        the live one. Pruning keeps the current generation unambiguous.
+
+        The newest stopped session is always kept, so `sessions()` stays non-empty and
+        a caller can still see that a kernel did report its own exit.
+        """
+        stopped = [t for t, s in self._sessions.items() if s.phase == "stopped"]
+        if len(stopped) <= 1:
+            return
+        stopped.sort(key=lambda t: self._sessions[t].registered_at)
+        for token in stopped[:-1]:
+            del self._sessions[token]
 
     def by_account(self, account: str) -> list[RemoteSession]:
         return [s for s in self.sessions() if s.account == account]
@@ -180,6 +214,16 @@ def build_relay_app(state: RelayState) -> Starlette:
             payload = {}
         session = await state.heartbeat(token, payload)
         if session is None:
+            # A kernel whose token the relay no longer holds keeps heartbeating into a
+            # 404 and stops updating `last_seen`. That is indistinguishable from a dead
+            # kernel from the outside, so it used to be returned silently; log the
+            # first one so the pool retiring a healthy session has a visible cause.
+            if state.note_unknown_heartbeat(token):
+                log.warning(
+                    "heartbeat for unknown token %s; its session is no longer registered. "
+                    "It will stop being tracked if this persists.",
+                    token[:8],
+                )
             return JSONResponse({"error": "unknown token"}, status_code=404)
         return JSONResponse(
             {

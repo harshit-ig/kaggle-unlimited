@@ -8,13 +8,16 @@ session we start so both budgets can be enforced locally before we burn GPU time
 from __future__ import annotations
 
 import json
-import sys
+import logging
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 WEEKLY_RESET_WEEKDAY = 5  # Saturday, matching Kaggle's weekly quota reset
+
+
+log = logging.getLogger("kaggle_rotate.quota")
 
 
 def utcnow() -> datetime:
@@ -115,6 +118,10 @@ class Ledger:
         self._lock = threading.Lock()
         self._sessions: list[Session] = []
         self._load()
+        # Every reader needs this, not just the pool. `status` and `accounts` build a
+        # Ledger directly, so running it only from the pool left both reporting usage
+        # that grew without bound for every session a crashed run left open.
+        self.reconcile()
 
     # ------------------------------------------------------------ persistence
 
@@ -180,11 +187,13 @@ class Ledger:
         cutoff = now - timedelta(hours=max_session_hours)
         stale = [s for s in self._sessions if s.is_live(now) and s.start < cutoff]
         for session in stale:
-            log_message = (
-                f"reconciling abandoned session for {session.account} "
-                f"started {session.started_at} (older than {max_session_hours}h)"
+            log.warning(
+                "reconciling abandoned session for %s started %s (older than %sh): it was "
+                "still open, so it kept accruing against the weekly limit",
+                session.account,
+                session.started_at,
+                max_session_hours,
             )
-            print(log_message, file=sys.stderr)
             session.ended_at = iso(session.start + timedelta(hours=max_session_hours))
             session.stop_reason = "reconciled: no pool owned this session"
         if stale:
@@ -194,19 +203,70 @@ class Ledger:
     def sessions(self) -> list[Session]:
         return list(self._sessions)
 
+    @staticmethod
+    def _counted_seconds(session: Session, session_end: datetime, inside: timedelta) -> float:
+        """Seconds to charge `session` for the part of it that falls inside the week.
+
+        Kaggle bills accelerator time, not wall time, so a session whose billed figure
+        is known is charged that. It is scaled by the share of the session inside the
+        window, so one straddling the reset is not charged in full to both weeks. A
+        non-positive figure is not treated as knowledge -- zero billed for a session
+        that demonstrably ran is not credible, and charging nothing would hide real
+        usage. When nothing usable is known this falls back to wall time, which
+        over-counts: a boot spends minutes compiling and downloading before the GPU
+        does anything.
+        """
+        if not session.billed_hours:
+            return inside.total_seconds()
+        whole = (session_end - session.start).total_seconds()
+        if whole <= 0:
+            return 0.0
+        return session.billed_hours * 3600.0 * (inside.total_seconds() / whole)
+
+    @staticmethod
+    def _overlap_seconds(spans: list[tuple[datetime, datetime]]) -> float:
+        """Seconds covered by more than one span, so overlapping sessions bill once."""
+        overlap = 0.0
+        furthest_end: datetime | None = None
+        for lo, hi in sorted(spans):
+            if furthest_end is not None and lo < furthest_end:
+                overlap += (min(hi, furthest_end) - lo).total_seconds()
+            furthest_end = hi if furthest_end is None else max(furthest_end, hi)
+        return overlap
+
     def used_hours(
         self,
         account: str | None = None,
         now: datetime | None = None,
     ) -> float:
         now = now or utcnow()
-        start, end = week_start(now), week_end(now)
-        total = 0.0
+        start = week_start(now)
+        # week_end takes a week *start*. Passing `now` gave `now + 7 days`, so the upper
+        # bound of the quota week was never actually applied.
+        end = week_end(start)
+        spans_by_account: dict[str, list[tuple[datetime, datetime]]] = {}
+        charged_by_account: dict[str, float] = {}
         for session in self._sessions:
             if account and session.account != account:
                 continue
             session_end = session.end or now
-            total += overlap_seconds(max(session.start, start), session_end, start, end)
+            lo = max(session.start, start)
+            hi = min(session_end, end)
+            if hi <= lo:
+                continue
+            spans_by_account.setdefault(session.account, []).append((lo, hi))
+            charged = charged_by_account.get(session.account, 0.0) + self._counted_seconds(
+                session, session_end, hi - lo
+            )
+            charged_by_account[session.account] = charged
+
+        # Sessions on one account can overlap after a rotation; the GPU was billed once
+        # for the shared stretch, so charging each in full counted it repeatedly. The
+        # union is per account: each account has its own weekly budget, so two accounts'
+        # sessions must never be merged against one another.
+        total = 0.0
+        for slug, spans in spans_by_account.items():
+            total += charged_by_account[slug] - self._overlap_seconds(spans)
         return hours(total)
 
     def usage(self, account: str, now: datetime | None = None) -> AccountUsage:

@@ -39,6 +39,11 @@ log = logging.getLogger("kaggle_rotate.pool")
 STATUS_POLL_TICKS = 60  # ~10 min at the default tick, when everything is serving
 BOOT_POLL_TICKS = 2  # while a kernel is booting, so a crash is noticed fast
 
+# How many consecutive failed health probes must precede a retirement. One is not
+# evidence: a single request that trips the 20s timeout on the way through a Cloudflare
+# edge is enough to make a perfectly healthy upstream look dead.
+MIN_PROBE_FAILURES = 3
+
 
 @dataclass
 class RunningServer:
@@ -51,15 +56,35 @@ class RunningServer:
 
 
 class _Server(uvicorn.Server):
-    """uvicorn.Server without signal handling; the pool owns the process signals."""
+    """uvicorn.Server without signal handling; the pool owns the process signals.
 
-    def install_signal_handlers(self) -> None:  # noqa: D102
-        return
+    uvicorn installs its handlers in `serve()` via `capture_signals()`, not in the
+    `install_signal_handlers()` this used to override -- so on current uvicorn the
+    override was dead code and starting the servers silently replaced the CLI's own
+    SIGINT handler. Two shutdown drivers then raced, and uvicorn began draining
+    connections before the pool had deleted a single kernel.
+    """
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Any:  # noqa: D102
+        yield
+
+
+# uvicorn defaults this to None and then waits forever for in-flight requests. A client
+# streaming a long generation would hold the pool open indefinitely, so it is bounded.
+SERVER_GRACEFUL_SHUTDOWN_SECONDS = 10.0
 
 
 def _serve(app: Any, host: str, port: int) -> RunningServer:
     server = _Server(
-        uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            access_log=False,
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+        )
     )
     return RunningServer(server=server, task=asyncio.create_task(server.serve()))
 
@@ -108,6 +133,10 @@ class Pool:
         self._coverage_note = ""
         self._last_coverage_note = ""
         self._relay_dead_logged = False
+        # Consecutive failed health probes per upstream. One failure is not evidence:
+        # a single 20s-timeout request through a Cloudflare edge is enough to flip it,
+        # and that used to arm the retirement timer in the same tick.
+        self._probe_failures: dict[str, int] = {}
 
     # ------------------------------------------------------------------- setup
 
@@ -240,6 +269,10 @@ class Pool:
     async def _probe_all(self) -> None:
         for upstream in self.router.candidates():
             healthy = await self._probe(upstream.url, model=upstream.model)
+            if healthy:
+                self._probe_failures.pop(upstream.name, None)
+            else:
+                self._probe_failures[upstream.name] = self._probe_failures.get(upstream.name, 0) + 1
             if healthy != upstream.healthy:
                 upstream.healthy = healthy
                 if healthy:
@@ -297,21 +330,40 @@ class Pool:
         if grace <= 0:
             return
         now = time.time()
-        remotes = {s.account: s for s in self.relay_state.sessions()}
         for slot in list(self.state.slots.values()):
             if slot.state not in {"active", "ready"}:
                 continue
             upstream = next((u for u in self.router.candidates() if u.name == slot.account), None)
             if upstream is not None and upstream.healthy:
                 continue
-            remote = remotes.get(slot.account)
-            last_signal = remote.last_seen if remote else slot.started_at
+            if self._probe_failures.get(slot.account, 0) < MIN_PROBE_FAILURES:
+                continue
+
+            # Liveness is measured against the session's *own* relay record, found by
+            # the slot's launch token. Keying it by account instead meant a dead earlier
+            # generation's frozen timestamp could be attributed to the healthy session
+            # currently serving -- which is how a working session got retired as silent.
+            remote = await self.relay_state.get(slot.token) if slot.token else None
+            last_signal = remote.last_seen if remote is not None else 0.0
+            if not last_signal:
+                # No relay record at all says nothing about silence, so say so plainly
+                # rather than falling back to the session's age. The old fallback used
+                # `slot.started_at`, which made the log read "has not responded for
+                # 1170s" for a session that had been up and serving the whole time.
+                log.warning(
+                    "%s has no relay record for its current launch (token %s); leaving it up",
+                    slot.account,
+                    slot.token[:8] or "none",
+                )
+                continue
             if now - last_signal < grace:
                 continue
             log.warning(
-                "%s has not responded for %.0fs; retiring it",
+                "%s has not responded for %.0fs (%d consecutive failed health probes); "
+                "retiring it",
                 slot.account,
                 now - last_signal,
+                self._probe_failures[slot.account],
             )
             await self._retire(slot.account, reason="session stopped responding", force=True)
 
@@ -348,7 +400,17 @@ class Pool:
                 await self._retire(
                     slot.account, reason=f"kernel {status.state.lower()}", force=True
                 )
-            if not status.alive and not status.terminal and slot.state in {"active", "ready"}:
+            # `status.known` is what separates "the kernel stopped" from "the probe
+            # failed". A hung or timed-out `kernels status` comes back UNKNOWN, which
+            # is neither alive nor terminal -- so without this check the very ambiguity
+            # `StatusResult.known` exists to flag read as "the kernel is gone", and one
+            # slow API call retired a healthy serving session.
+            if (
+                status.known
+                and not status.alive
+                and not status.terminal
+                and slot.state in {"active", "ready"}
+            ):
                 await self._retire(slot.account, reason="kernel no longer running", force=True)
 
     def _open_ledger_slot(self, slot: SlotState) -> None:
@@ -364,6 +426,13 @@ class Pool:
         active_slot = self._active_slot()
 
         if active_slot is None:
+            # A kernel that is already launching or booting is coverage this pool has.
+            # Without this the "nothing is serving" branch fires on every tick of an
+            # ordinary boot, and `_pick_launch_target` then rejects the very account it
+            # just launched -- so the pool reported a coverage gap against its own
+            # session, on every single start.
+            if self._pending_slot() is not None:
+                return
             if await self._pick_launch_target(force_if_idle=True) is None:
                 self._log_coverage_gap()
             return
@@ -383,6 +452,13 @@ class Pool:
     def _active_slot(self) -> SlotState | None:
         for slot in self.state.slots.values():
             if slot.state == "active":
+                return slot
+        return None
+
+    def _pending_slot(self) -> SlotState | None:
+        """A slot the pool is already bringing up -- coverage in progress, not a gap."""
+        for slot in self.state.slots.values():
+            if slot.state in {"launching", "booting", "ready"}:
                 return slot
         return None
 
@@ -446,7 +522,7 @@ class Pool:
         logged rather than happening silently.
         """
         try:
-            return await self.cli.aquota_cached(account, self.quota_cache)
+            snapshot = await self.cli.aquota_cached(account, self.quota_cache)
         except QuotaUnavailable as exc:
             self.quota_cache.failures += 1
             log.warning(
@@ -456,6 +532,27 @@ class Pool:
                 exc,
             )
             return None
+        self._persist_quota(account.slug, snapshot)
+        return snapshot
+
+    def _persist_quota(self, account_slug: str, snapshot: QuotaSnapshot) -> None:
+        """Write the reading onto the slot so it survives the process.
+
+        `status` reads these fields out of pool.json and has no other way to reach
+        Kaggle, so anything not written here is invisible to it -- which is why it used
+        to print "no Kaggle reading yet" while `accounts` showed a live figure for the
+        same account. Only persisted when the numbers actually move, so the per-tick
+        cache hit does not rewrite the file every 10 seconds.
+        """
+        fields = {
+            "kaggle_weekly_used_hours": round(snapshot.used_hours, 4),
+            "kaggle_weekly_remaining_hours": round(snapshot.remaining_hours, 4),
+            "kaggle_quota_refresh_at": snapshot.refresh_at,
+            "quota_source": "kaggle",
+        }
+        slot = self.state.get(account_slug)
+        if any(getattr(slot, key) != value for key, value in fields.items()):
+            self.state.update(account_slug, **fields)
 
     def _remaining_for(self, account: Account, snapshot: QuotaSnapshot) -> float:
         """Remaining weekly hours under any operator cap, from Kaggle's numbers.
@@ -491,6 +588,13 @@ class Pool:
             if not account.enabled:
                 continue
             slot = self.state.get(account.slug)
+            # `_boot_tasks` is the authoritative "already launching this" record. The
+            # status field lags it: `create_task` does not run the coroutine, so for a
+            # tick the slot still reads "idle" and a second launch can be started for an
+            # account that is already pushing a kernel.
+            if account.slug in self._boot_tasks:
+                skipped.append(f"{account.slug}: launch already in flight")
+                continue
             if slot.state in {"launching", "booting", "ready", "active", "draining"}:
                 skipped.append(f"{account.slug}: already has a session")
                 continue
@@ -542,32 +646,69 @@ class Pool:
     # ------------------------------------------------------------------ launch
 
     async def _launch_and_wait(self, account: Account) -> None:
-        self.state.update(account.slug, last_attempt=time.time())
         try:
-            spec = await self._launch(account)
-        except Exception as exc:
-            log.error("launch failed for %s: %s", account.slug, exc)
-            slot = self.state.get(account.slug)
-            slot.attempts += 1
-            self.state.update(account.slug, state="failed", detail=str(exc))
-            self._close_ledger(account.slug, reason=f"launch failed: {exc}")
-            log.info(
-                "next attempt for %s in %.0fs",
-                account.slug,
-                self._launch_backoff(slot.attempts),
-            )
-            return
-        try:
-            await self._await_ready(account.slug, spec)
-        except Exception as exc:
-            log.error("boot failed for %s: %s", account.slug, exc)
-            slot = self.state.get(account.slug)
-            slot.attempts += 1
-            self.state.update(account.slug, state="failed", detail=str(exc))
-            await self._retire(account.slug, reason="boot failed", force=True)
-            return
+            self.state.update(account.slug, last_attempt=time.time())
+            try:
+                spec = await self._launch(account)
+            except Exception as exc:
+                log.error("launch failed for %s: %s", account.slug, exc)
+                slot = self.state.get(account.slug)
+                slot.attempts += 1
+                self.state.update(account.slug, state="failed", detail=str(exc))
+                self._close_ledger(account.slug, reason=f"launch failed: {exc}")
+                log.info(
+                    "next attempt for %s in %.0fs",
+                    account.slug,
+                    self._launch_backoff(slot.attempts),
+                )
+                return
+            try:
+                await self._await_ready(account.slug, spec)
+            except Exception as exc:
+                log.error("boot failed for %s: %s", account.slug, exc)
+                slot = self.state.get(account.slug)
+                slot.attempts += 1
+                self.state.update(account.slug, state="failed", detail=str(exc))
+                await self._retire(account.slug, reason="boot failed", force=True)
+                return
         finally:
-            self._boot_tasks.pop(account.slug, None)
+            # Wraps both phases, and only clears the handle when it is still ours: the
+            # `finally` used to hang off the second `try`, so a failed push kept the
+            # entry forever, and a blind pop could orphan a second monitor's task --
+            # which then nothing, not even shutdown, could cancel.
+            if self._boot_tasks.get(account.slug) is asyncio.current_task():
+                self._boot_tasks.pop(account.slug, None)
+
+    async def _cancel_boot(self, account_slug: str) -> None:
+        """Cancel the boot in flight for `account_slug`, if it is not the caller.
+
+        `_retire` is reached both from outside -- a kernel that died during boot, an
+        unhealthy session -- and from inside `_launch_and_wait` when the boot itself
+        failed. Cancelling the caller would abort the retire between marking the slot
+        and deleting the kernel, which is precisely the case where the delete must not
+        be skipped, so that path is left to the caller to finish.
+
+        A boot cancelled from outside never reaches its own error handler, so its
+        attempt is booked here instead; without that the account stayed immediately
+        re-admissible and the next tick launched another kernel straight away.
+        """
+        task = self._boot_tasks.pop(account_slug, None)
+        if task is None or task is asyncio.current_task():
+            return
+        slot = self.state.get(account_slug)
+        self.state.update(
+            account_slug,
+            last_attempt=time.time(),
+            attempts=slot.attempts + 1,
+        )
+        log.info(
+            "cancelled the in-flight boot for %s; next attempt no sooner than %.0fs",
+            account_slug,
+            self._launch_backoff(slot.attempts + 1),
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     def _launch_backoff(self, attempts: int) -> float:
         rotation = self.config.rotation
@@ -605,6 +746,7 @@ class Pool:
             kernel_ref=kernel_ref,
             token=token,
             started_at=time.time(),
+            boot_started_at=time.time(),
             url="",
             model=served.model,
             detail="pushing kernel",
@@ -640,10 +782,27 @@ class Pool:
 
     async def _await_ready(self, account_slug: str, spec: LaunchSpec) -> None:
         rotation = self.config.rotation
-        deadline = time.monotonic() + rotation.boot_timeout_seconds
+        # The budget runs from the push, not from this function. `kaggle kernels push`
+        # returns only once Kaggle has scheduled the kernel, which can itself take
+        # minutes, so a deadline started here was quietly longer than the configured one
+        # and could outlast a rotation. Whatever the push already spent comes off it.
+        slot = self.state.get(account_slug)
+        spent_on_push = max(0.0, time.time() - slot.boot_started_at) if slot.boot_started_at else 0.0
         started = time.monotonic()
+        deadline = started + max(0.0, rotation.boot_timeout_seconds - spent_on_push)
         last_progress = 0.0
         while time.monotonic() < deadline and not self._stopping:
+            # A launch is identified by its token, so this is how a monitor that has
+            # been superseded notices. It is the last line of defence behind
+            # `_cancel_boot`: the loop is time-bounded only, so without this a stale
+            # monitor would happily keep polling -- and keep announcing "still booting"
+            # -- for a session that had already been cut over and deleted.
+            if self.state.get(account_slug).token != spec.token:
+                log.info(
+                    "%s: boot superseded by a newer launch; abandoning this one",
+                    account_slug,
+                )
+                return
             remote = await self.relay_state.get(spec.token)
             if remote is not None and remote.phase == "serving":
                 if await self._probe(remote.url, model=spec.model):
@@ -676,7 +835,7 @@ class Pool:
             # the notebook on kaggle.com where the real progress is visible.
             if time.monotonic() - last_progress >= 60:
                 last_progress = time.monotonic()
-                minutes = (time.monotonic() - started) / 60
+                minutes = (spent_on_push + time.monotonic() - started) / 60
                 stage = (
                     "tunnel is up, waiting for llama-server to report healthy"
                     if remote is not None
@@ -685,8 +844,10 @@ class Pool:
                 )
                 log.info("%s still booting (%.0f min): %s", account_slug, minutes, stage)
             await asyncio.sleep(15)
+        elapsed = spent_on_push + (time.monotonic() - started)
         raise TimeoutError(
-            f"{account_slug} did not become ready within {rotation.boot_timeout_seconds}s"
+            f"{account_slug} did not become ready within {rotation.boot_timeout_seconds}s "
+            f"({elapsed:.0f}s elapsed, {spent_on_push:.0f}s of it spent pushing the kernel)"
         )
 
     # ----------------------------------------------------------------- promote
@@ -770,6 +931,14 @@ class Pool:
         if slot.state in {"stopped", "idle", "failed"} and not force:
             return
 
+        # Retire cancels whatever boot this account is in the middle of. It used not to,
+        # so the "still booting (N min)" monitor kept polling a session that had already
+        # been stopped and deleted, printing for the rest of its own 2400s window -- and
+        # because `_retire` resets the slot to "stopped" with no backoff, the very next
+        # tick could start a second boot for the same account while the first was still
+        # running. That is where two disagreeing counters for one account came from.
+        await self._cancel_boot(account_slug)
+
         self.state.update(account_slug, state="draining", detail=reason)
         self.router.drop(account_slug)
 
@@ -839,10 +1008,20 @@ class Pool:
         self._stopping = True
         log.info("shutting down pool")
 
+        # Stop taking work first. These used to be set at the very end, after the
+        # kernels were deleted -- so clients kept being accepted and forwarded to
+        # upstreams that were being torn down underneath them, and a request parked
+        # waiting for an upstream could not drain because the teardown it was waiting
+        # on had not started.
+        self.proxy.begin_shutdown()
+        for server in self.servers:
+            server.server.should_exit = True
+
         for task in list(self._boot_tasks.values()):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        self._boot_tasks.clear()
 
         if self._retire_tasks:
             with contextlib.suppress(TimeoutError):
@@ -860,10 +1039,11 @@ class Pool:
         if self.relay_tunnel is not None:
             await self.relay_tunnel.stop()
         for server in self.servers:
-            server.server.should_exit = True
-        for server in self.servers:
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait_for(server.task, timeout=10)
+            # Both exceptions are suppressed: `wait_for` raises TimeoutError when the
+            # budget runs out, and that used to escape `shutdown()` entirely, which
+            # skipped the pidfile clear and left the remaining servers unawaited.
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(server.task, timeout=SERVER_GRACEFUL_SHUTDOWN_SECONDS)
 
     # ------------------------------------------------------------------ status
 

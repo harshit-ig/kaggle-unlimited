@@ -169,6 +169,11 @@ class ProxyApp:
         self.connect_grace = connect_grace
         # Lets the pool notice that clients are (or are no longer) using the GPU.
         self.on_traffic = on_traffic
+        # Set when the pool starts tearing down. Without it a request that arrived while
+        # nothing was serving sat out the whole connect_grace, holding its uvicorn
+        # connection open -- and the server task could not finish, so shutdown timed
+        # out and dumped a CancelledError traceback on every Ctrl-C.
+        self._draining = asyncio.Event()
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=30.0),
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
@@ -309,6 +314,10 @@ class ProxyApp:
             status_code=502,
         )
 
+    def begin_shutdown(self) -> None:
+        """Stop waiting for an upstream that is never going to arrive."""
+        self._draining.set()
+
     async def _await_upstream(self) -> Upstream | None:
         """Wait briefly for a session instead of failing during a cutover or boot."""
         deadline = time.monotonic() + self.connect_grace
@@ -316,7 +325,9 @@ class ProxyApp:
             upstream = self.router.pick()
             if upstream is not None:
                 return upstream
-            if time.monotonic() >= deadline:
+            # Shutdown overrides the grace: no upstream is coming, so waiting out the
+            # full window would just delay the server exiting.
+            if self._draining.is_set() or time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(0.1)
 

@@ -150,3 +150,82 @@ class SessionFixture:
 
     def elapsed_hours(self, now=None) -> float:
         return ((now or utcnow()) - self._started).total_seconds() / 3600
+
+
+def test_an_abandoned_session_is_reconciled_on_load(tmp_path):
+    """A session left open by a crashed run accrues until `now`, every single time the
+    ledger is read, and grows without bound. Reconciling used to happen only inside the
+    pool, so `status` and `accounts` -- which build a Ledger directly -- reported it as
+    usage forever."""
+    path = tmp_path / "ledger.json"
+    first = Ledger(path)
+    session = first.open_session("a", "a/k", now=utcnow() - timedelta(hours=30))
+    assert session.is_live()
+
+    reloaded = Ledger(path)
+
+    assert reloaded.find_live("a") is None, "an ownerless session must not stay open"
+    assert reloaded.used_hours("a") == 12.0, "bounded by the session cap, not by now"
+    assert "reconciled" in reloaded.sessions()[0].stop_reason
+
+
+def test_overlapping_sessions_are_charged_once(tmp_path):
+    """Two sessions on one account whose spans intersect were charged the sum of both,
+    so the shared stretch counted twice."""
+    ledger = Ledger(tmp_path / "ledger.json")
+    now = utcnow()
+    first = ledger.open_session("a", "a/k", now=now - timedelta(hours=4))
+    ledger.close_session(first, "done", now=now - timedelta(hours=2))
+    second = ledger.open_session("a", "a/k", now=now - timedelta(hours=3))
+    ledger.close_session(second, "done", now=now)
+
+    # Wall spans cover 4h in total; the 1h they share is not billed twice.
+    assert ledger.used_hours("a") == 4.0
+
+
+def test_separate_accounts_are_never_merged(tmp_path):
+    """Each account has its own weekly budget, so one account's sessions must not be
+    unioned against another's just because they ran at the same time."""
+    ledger = Ledger(tmp_path / "ledger.json")
+    now = utcnow()
+    for account in ("a", "b"):
+        session = ledger.open_session(account, f"{account}/k", now=now - timedelta(hours=4))
+        ledger.close_session(session, "done", now=now)
+
+    assert ledger.used_hours("a") == 4.0
+    assert ledger.used_hours("b") == 4.0
+    assert ledger.total_used_hours() == 8.0
+
+
+def test_a_known_billed_figure_is_preferred_over_wall_time(tmp_path):
+    """Kaggle bills accelerator time. A session that sat for six hours but reports two
+    hours billed is two hours of quota."""
+    ledger = Ledger(tmp_path / "ledger.json")
+    now = utcnow()
+    session = ledger.open_session("a", "a/k", now=now - timedelta(hours=6))
+    ledger.close_session(session, "done", now=now, billed_hours=2.0)
+
+    assert ledger.used_hours("a") == 2.0
+
+
+def test_a_zero_billed_figure_does_not_erase_a_session_that_ran(tmp_path):
+    """Zero billed for a session that demonstrably ran is not credible. Charging it as
+    zero would hide real usage, which is the one direction a budget must never err."""
+    ledger = Ledger(tmp_path / "ledger.json")
+    now = utcnow()
+    session = ledger.open_session("a", "a/k", now=now - timedelta(hours=3))
+    ledger.close_session(session, "done", now=now, billed_hours=0.0)
+
+    assert ledger.used_hours("a") == 3.0
+
+
+def test_usage_is_clipped_to_the_actual_quota_week(tmp_path):
+    """`week_end` takes a week start; it was being passed `now`, so the window ran to
+    `now + 7 days` and the upper bound was never applied."""
+    ledger = Ledger(tmp_path / "ledger.json")
+    now = utcnow()
+    # A session from last week's window must not be charged to this week.
+    stale = ledger.open_session("a", "a/k", now=week_start(now) - timedelta(hours=5))
+    ledger.close_session(stale, "done", now=week_start(now) - timedelta(hours=1))
+
+    assert ledger.used_hours("a", now=now) == 0.0

@@ -327,9 +327,18 @@ def test_kernel_metadata_targets_the_t4_and_stays_private():
     metadata = kernel_metadata(_config(), _spec())
     assert metadata["id"] == "acct/kaggle-rotate-llamacpp"
     assert metadata["machine_shape"] == "NvidiaTeslaT4"
-    assert metadata["enable_gpu"] == "true"
-    assert metadata["is_private"] == "true"
+    assert metadata["enable_gpu"] is True
+    assert metadata["is_private"] is True
     assert metadata["code_file"] == "server.ipynb"
+
+
+def test_the_kernel_is_pushed_with_networking_enabled():
+    """The setup cells fetch the llama.cpp release index from the GitHub API and the
+    GGUF from HuggingFace. Kaggle runs a kernel with networking off unless asked, and
+    the first setup cell then raises -- which on kaggle.com looks like a kernel that
+    died for no stated reason."""
+    metadata = kernel_metadata(_config(), _spec())
+    assert metadata["enable_internet"] is True
 
 
 def test_missing_source_notebook_does_not_crash_rendering(tmp_path):

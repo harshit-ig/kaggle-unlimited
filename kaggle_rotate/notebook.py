@@ -628,8 +628,15 @@ def kernel_metadata(config: Config, spec: LaunchSpec) -> dict[str, Any]:
         "code_file": "server.ipynb",
         "language": "python",
         "kernel_type": "notebook",
-        "is_private": "true" if config.kernel.is_private else "false",
-        "enable_gpu": "true",
+        "is_private": config.kernel.is_private,
+        "enable_gpu": True,
+        "enable_tpu": False,
+        # The notebook fetches the llama.cpp release index from the GitHub API and the
+        # GGUF from HuggingFace. Without this Kaggle runs the kernel with networking
+        # off and the first setup cell raises, which reads on kaggle.com as a kernel
+        # that died for no stated reason.
+        "enable_internet": True,
+        "keywords": [],
         "machine_shape": config.kernel.accelerator,
         "dataset_sources": [],
         "kernel_sources": [],

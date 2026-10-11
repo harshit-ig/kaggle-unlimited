@@ -45,20 +45,51 @@ class Account:
         return self.weekly_limit_hours or default
 
 
-# Kaggle phrases "this kernel does not exist / is not yours" as several different
-# errors, including a permission error for the owner's own deleted kernels.
+# Kaggle's "this kernel is gone" signal and its "you may not touch this kernel" signal
+# are both a 403, distinguished only by wording. Only the first proves nothing is
+# running, so the permission wording is deliberately excluded here: it is also what a
+# wrong credential, another owner's kernel, and an account without phone verification
+# come back as. Counting those as "deleted" is how a live kernel keeps billing GPU time
+# while cleanup prints that everything is fine.
 _GONE_PATTERNS = (
-    "cannot access kernel",
-    "was denied",
-    "not found",
     "does not exist",
-    "no such",
+    "no such kernel",
+    "not found",
+    "404",
 )
+
+# Refusal wording that leaves the question open rather than settling it.
+_REFUSED_PATTERNS = (
+    "was denied",
+    "forbidden",
+    "403",
+    "cannot access kernel",
+    "permission",
+)
+
+# Exit codes that mean the command never reached Kaggle, so its output proves nothing
+# either way: 124 is our own timeout, 127 is a missing `kaggle` binary.
+_TRANSPORT_EXITS = frozenset({124, 127})
 
 
 def kernel_is_gone(error: KaggleError) -> bool:
+    """True only when `error` proves the kernel does not exist.
+
+    A 403 never qualifies, even with "cannot access kernel" in the body. Resolve those
+    with `lists_kernel`, which is authorised per account rather than per kernel.
+    """
+    if error.returncode in _TRANSPORT_EXITS:
+        return False
     blob = f"{error.stdout}\n{error.stderr}".lower()
     return any(pattern in blob for pattern in _GONE_PATTERNS)
+
+
+def kernel_delete_refused(error: KaggleError) -> bool:
+    """True when Kaggle refused the delete without settling whether it still runs."""
+    if error.returncode in _TRANSPORT_EXITS:
+        return False
+    blob = f"{error.stdout}\n{error.stderr}".lower()
+    return any(pattern in blob for pattern in _REFUSED_PATTERNS)
 
 
 class KaggleError(RuntimeError):
@@ -361,11 +392,13 @@ class KaggleCLI:
         )
         return False
 
-    def delete(self, account: Account) -> bool:
-        """Delete a kernel. Returns False if Kaggle refused or the kernel is absent.
+    def delete(self, account: Account) -> KaggleError | None:
+        """Delete a kernel. Returns None on success, or the error that refused it.
 
-        Kaggle answers 403 for a kernel that is already gone, so a non-zero exit here
-        does not necessarily mean something is still running. Verify with `status`.
+        The error is the whole point of the return value. A non-zero exit does not say
+        whether the kernel is already gone or merely unreachable, and `False` threw
+        that distinction away -- which is how a refused delete came to be reported as
+        "already gone" while the kernel kept billing.
         """
         proc = self.run(
             account,
@@ -381,14 +414,33 @@ class KaggleCLI:
                 self.config.kernel_ref(account.username),
                 proc.stdout.strip() or "no output",
             )
-            return True
-        log.error(
-            "%s delete failed (exit %s): %s",
-            self.config.kernel_ref(account.username),
+            return None
+        error = KaggleError(
+            [self.config.kaggle.command, "kernels", "delete", self.config.kernel_ref(account.username)],
             proc.returncode,
-            (proc.stderr or proc.stdout).strip()[:400] or "no output",
+            proc.stdout,
+            proc.stderr,
         )
-        return False
+        log.error("%s", error)
+        return error
+
+    def lists_kernel(self, account: Account) -> bool:
+        """True when this account's own kernel list still shows the kernel we own.
+
+        The confirmation `kernels status` cannot give: status is authorised per kernel
+        and answers 403 for the very permission under question, while this is
+        authorised per account, so it still answers. `--mine` is essential -- a plain
+        listing is every public kernel on the platform, where the answer depends on
+        paging, so "absent" would mean nothing.
+
+        Raises on a failed listing rather than treating empty output as absence: an
+        unanswered question must not be read as the reassuring one.
+        """
+        ref = self.config.kernel_ref(account.username)
+        listing = self.run(
+            account, "kernels", "list", "--mine", "--page-size", "200"
+        ).stdout
+        return ref in listing
 
     def files(self, account: Account, pattern: str = "") -> str:
         args = ["kernels", "files", self.config.kernel_ref(account.username), "--page-size", "200"]
